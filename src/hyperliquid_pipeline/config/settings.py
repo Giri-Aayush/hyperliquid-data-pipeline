@@ -1,0 +1,104 @@
+"""Configuration settings for the Hyperliquid data pipeline."""
+
+from typing import List, Optional
+from pydantic_settings import BaseSettings
+from pydantic import Field
+from pathlib import Path
+import os
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables."""
+    
+    # Hyperliquid API Configuration
+    hyperliquid_api_url: str = Field(default="https://api.hyperliquid.xyz")
+    hyperliquid_wallet_address: Optional[str] = None
+    hyperliquid_private_key: Optional[str] = None
+    
+    # AWS Configuration
+    aws_access_key_id: Optional[str] = None
+    aws_secret_access_key: Optional[str] = None
+    aws_default_region: str = Field(default="us-east-1")
+    
+    # Database Configuration
+    postgres_host: str = Field(default="localhost")
+    postgres_port: int = Field(default=5432)
+    postgres_db: str = Field(default="hyperliquid_data")
+    postgres_user: str = Field(default="hyperliquid")
+    postgres_password: Optional[str] = None
+    
+    # InfluxDB Configuration
+    influxdb_url: str = Field(default="http://localhost:8086")
+    influxdb_token: Optional[str] = None
+    influxdb_org: str = Field(default="hyperliquid")
+    influxdb_bucket: str = Field(default="market_data")
+    
+    # Redis Configuration
+    redis_host: str = Field(default="localhost")
+    redis_port: int = Field(default=6379)
+    redis_password: Optional[str] = None
+    redis_db: int = Field(default=0)
+    
+    # Data Storage Paths
+    data_root_path: Path = Field(default=Path("./data"))
+    historical_data_path: Path = Field(default=Path("./data/historical"))
+    real_time_data_path: Path = Field(default=Path("./data/realtime"))
+    logs_path: Path = Field(default=Path("./logs"))
+    
+    # Monitoring & Alerts
+    telegram_bot_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
+    prometheus_port: int = Field(default=8000)
+    
+    # Data Collection Settings
+    collect_symbols: str = Field(default="BTC,ETH,SOL,ARB,AVAX,MATIC,OP,LTC,LINK,UNI")
+    historical_start_date: str = Field(default="2023-01-01")
+    real_time_enabled: bool = Field(default=True)
+    websocket_reconnect_delay: int = Field(default=5)
+    
+    # Logging
+    log_level: str = Field(default="INFO")
+    log_rotation: str = Field(default="1 day")
+    log_retention: str = Field(default="30 days")
+    
+    # S3 Archive Settings
+    hyperliquid_archive_bucket: str = Field(default="hyperliquid-archive")
+    node_data_bucket: str = Field(default="hl-mainnet-node-data")
+    request_payer: str = Field(default="requester")
+    
+    class Config:
+        """Pydantic config."""
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        case_sensitive = False
+        
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # Create directories if they don't exist
+        self.data_root_path.mkdir(parents=True, exist_ok=True)
+        self.historical_data_path.mkdir(parents=True, exist_ok=True)
+        self.real_time_data_path.mkdir(parents=True, exist_ok=True)
+        self.logs_path.mkdir(parents=True, exist_ok=True)
+    
+    @property
+    def postgres_url(self) -> str:
+        """Get PostgreSQL connection URL."""
+        return (
+            f"postgresql://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
+    
+    @property
+    def redis_url(self) -> str:
+        """Get Redis connection URL."""
+        auth = f":{self.redis_password}@" if self.redis_password else ""
+        return f"redis://{auth}{self.redis_host}:{self.redis_port}/{self.redis_db}"
+    
+    @property
+    def symbols_list(self) -> List[str]:
+        """Get collect_symbols as a list."""
+        return [s.strip() for s in self.collect_symbols.split(",")]
+
+
+# Global settings instance
+settings = Settings()
