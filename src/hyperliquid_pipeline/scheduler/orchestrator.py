@@ -78,20 +78,23 @@ class DataPipelineOrchestrator:
             # Initialize real-time collector
             self.realtime_collector = HyperliquidWebSocketCollector(settings.symbols_list)
             
-            # Set up data flow: validation -> processing -> storage
-            def validated_data_callback(data_point):
+            # Set up data flow: validation -> processing -> storage.
+            # Async so the collector's consumer awaits it — backpressure lands on
+            # the bounded queue (drop-oldest) instead of spawning an unbounded
+            # number of tasks per message under load.
+            async def validated_data_callback(data_point):
                 """Process validated data."""
                 try:
                     # Validate and sanitize
                     validated_data = self.validation_callback(data_point)
                     if validated_data:
                         # Process the data
-                        asyncio.create_task(self.data_processor.process_market_data(validated_data))
-                        
+                        await self.data_processor.process_market_data(validated_data)
+
                         # Update stats
                         self.stats['messages_processed'] += 1
                         self.stats['last_data_time'] = datetime.now(timezone.utc)
-                    
+
                 except Exception as e:
                     self.stats['errors_encountered'] += 1
                     self.logger.error(f"Error in data callback: {e}")
