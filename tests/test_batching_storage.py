@@ -227,3 +227,47 @@ def test_close_is_idempotent_and_rejects_late_writes():
         assert await bs.store_data_point(_pt(2)) is False
 
     asyncio.run(run())
+
+
+def test_asset_ctx_folded_into_processed_point():
+    """OI/mark/basis must reach the DB via the processed summary, not just JSONL."""
+    import sys
+    from datetime import datetime, timezone
+    from hyperliquid_pipeline.processors.data_processor import DataProcessor
+    from hyperliquid_pipeline.collectors.realtime_collector import MarketDataPoint
+
+    async def run():
+        captured = []
+
+        class _Store(DataStorage):
+            async def store_data_point(self, dp):
+                captured.append(dp)
+                return True
+            async def store_data_points(self, dps):
+                captured.extend(dps)
+                return len(dps)
+            async def get_data(self, *a):
+                return []
+            async def close(self):
+                pass
+
+        dp = DataProcessor(_Store())
+        now = datetime.now(timezone.utc)
+        # asset_ctx arrives first, then a trade triggers a processed summary
+        await dp.process_market_data(MarketDataPoint(
+            timestamp=now, symbol="BTC", data_type="asset_ctx",
+            data={"mark_price": 50010.0, "oracle_price": 50000.0,
+                  "open_interest": 1234.5, "basis": 10.0, "basis_bps": 2.0},
+        ))
+        await dp.process_market_data(MarketDataPoint(
+            timestamp=now, symbol="BTC", data_type="trade",
+            data={"price": 50005.0, "size": 0.1, "side": "buy"},
+        ))
+        processed = [p for p in captured if p.data_type == "processed"]
+        assert processed, "no processed point stored"
+        ctx = processed[-1].data.get("asset_ctx")
+        assert ctx is not None
+        assert ctx["open_interest"] == 1234.5
+        assert ctx["basis"] == 10.0
+
+    asyncio.run(run())
