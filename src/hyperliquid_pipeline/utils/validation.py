@@ -54,7 +54,7 @@ class DataValidator:
         # Historical data for comparison
         self.price_history: Dict[str, List[float]] = {}
         self.volume_history: Dict[str, List[float]] = {}
-        self.timestamp_history: Dict[str, List[datetime]] = {}
+        self.timestamp_history: Dict[Tuple[str, str], List[datetime]] = {}
         
         # Validation thresholds
         self.price_change_threshold = 0.10  # 10% max price change
@@ -249,9 +249,12 @@ class DataValidator:
                 data_point=data_point
             ))
         
-        # Duplicate timestamp check
-        if symbol in self.timestamp_history:
-            for hist_timestamp in self.timestamp_history[symbol]:
+        # Duplicate timestamp check — scoped to this symbol AND data type, so the
+        # several now()-stamped feeds for one coin (trades, ticker, asset_ctx,...)
+        # don't spuriously flag each other as duplicates.
+        key = (symbol, data_point.data_type)
+        if key in self.timestamp_history:
+            for hist_timestamp in self.timestamp_history[key]:
                 if abs((timestamp - hist_timestamp).total_seconds()) < self.duplicate_time_threshold.total_seconds():
                     results.append(ValidationResult(
                         level=ValidationLevel.WARNING,
@@ -259,16 +262,16 @@ class DataValidator:
                         data_point=data_point
                     ))
                     break
-        
+
         # Update timestamp history
-        if symbol not in self.timestamp_history:
-            self.timestamp_history[symbol] = []
-        self.timestamp_history[symbol].append(timestamp)
-        
+        if key not in self.timestamp_history:
+            self.timestamp_history[key] = []
+        self.timestamp_history[key].append(timestamp)
+
         # Keep only recent history
-        if len(self.timestamp_history[symbol]) > 100:
-            self.timestamp_history[symbol] = self.timestamp_history[symbol][-100:]
-        
+        if len(self.timestamp_history[key]) > 100:
+            self.timestamp_history[key] = self.timestamp_history[key][-100:]
+
         return results
     
     def validate_data_point(self, data_point: MarketDataPoint) -> List[ValidationResult]:
@@ -357,10 +360,13 @@ class DataValidator:
         completeness_ratio = 1.0 - (error_count / total_points) if total_points > 0 else 0.0
         accuracy_score = 1.0 - ((error_count + warning_count * 0.5) / total_points) if total_points > 0 else 0.0
         
-        # Data freshness
-        if symbol in self.timestamp_history and self.timestamp_history[symbol]:
-            latest_timestamp = max(self.timestamp_history[symbol])
-            data_freshness = datetime.now(timezone.utc) - latest_timestamp
+        # Data freshness — newest timestamp across all of this symbol's feeds.
+        symbol_timestamps = [
+            ts for (s, _dtype), hist in self.timestamp_history.items()
+            if s == symbol for ts in hist
+        ]
+        if symbol_timestamps:
+            data_freshness = datetime.now(timezone.utc) - max(symbol_timestamps)
         else:
             data_freshness = timedelta(hours=24)  # Unknown
         

@@ -113,3 +113,26 @@ class TestVolumeValidation:
         for _ in range(10):
             v.validate_volume_data(trade_point(100.0, 1.0))
         assert v.validate_volume_data(trade_point(100.0, 2.0)) == []
+
+
+def test_timestamp_duplicate_scoped_per_data_type():
+    """Different feeds for one symbol at the same instant must not flag each
+    other as duplicates; a true same-feed repeat still does."""
+    from datetime import datetime, timezone
+
+    v = DataValidator()
+    ts = datetime.now(timezone.utc)
+
+    def pt(dtype):
+        return MarketDataPoint(timestamp=ts, symbol="BTC", data_type=dtype, data={})
+
+    r_trade = v.validate_timestamp_data(pt("trade"))
+    assert not any("Duplicate" in x.message for x in r_trade)
+
+    # asset_ctx at the same instant, different feed -> NOT a duplicate
+    r_ctx = v.validate_timestamp_data(pt("asset_ctx"))
+    assert not any("Duplicate" in x.message for x in r_ctx)
+
+    # a second trade at the same instant, same feed -> IS a duplicate
+    r_trade2 = v.validate_timestamp_data(pt("trade"))
+    assert any("Duplicate" in x.message for x in r_trade2)
