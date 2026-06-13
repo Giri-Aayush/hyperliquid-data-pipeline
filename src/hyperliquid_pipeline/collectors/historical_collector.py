@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 
 from ..config import settings
+from ..storage.object_store import ObjectStore, get_object_store
 
 
 @dataclass
@@ -35,8 +36,15 @@ class S3Location:
 class HistoricalDataCollector:
     """Collects historical data from Hyperliquid S3 archives."""
     
-    def __init__(self):
-        """Initialize the historical data collector."""
+    def __init__(self, object_store: Optional[ObjectStore] = None):
+        """Initialize the historical data collector.
+
+        Args:
+            object_store: optional S3-compatible cache/sink (Cloudflare R2, AWS S3,
+                MinIO, ...). Defaults to the configured store; pass explicitly in
+                tests. When set, raw pulls are cached here (pay AWS once, re-read
+                free) and processed Parquet is mirrored. None disables it.
+        """
         self.s3_client = boto3.client(
             's3',
             aws_access_key_id=settings.aws_access_key_id,
@@ -45,6 +53,7 @@ class HistoricalDataCollector:
         )
         self.local_data_path = settings.historical_data_path
         self.logger = logger.bind(component="historical_collector")
+        self.object_store = object_store if object_store is not None else get_object_store()
         
     def generate_date_range(
         self, 
@@ -95,20 +104,42 @@ class HistoricalDataCollector:
         else:
             raise ValueError(f"Unknown data type: {request.data_type}")
     
+    def _cache_key(self, s3_location: S3Location) -> str:
+        """Object-store key mirroring a source S3 location (namespaced by bucket)."""
+        return f"raw/{s3_location.bucket}/{s3_location.key}"
+
     def download_file(self, s3_location: S3Location, local_path: Path) -> bool:
-        """Download a file from S3.
-        
+        """Fetch a file, preferring the object-store cache over the paid AWS pull.
+
+        Read-through/write-back: if the object store already has this object we
+        download it from there (free on R2); otherwise we pull from Hyperliquid's
+        requester-pays bucket and write a copy back to the cache.
+
         Args:
             s3_location: S3 location to download from
             local_path: Local path to save the file
-            
+
         Returns:
             True if successful, False otherwise
         """
+        cache_key = self._cache_key(s3_location)
+
+        # Read-through: serve from the object store if we cached it before.
+        # Guard against an empty/truncated cached object (e.g. a no-data hour
+        # that got cached as 0 bytes) — treat it as a miss and re-pull rather
+        # than serving a corrupt file forever.
+        if self.object_store and self.object_store.get_file(cache_key, local_path):
+            if local_path.exists() and local_path.stat().st_size > 0:
+                self.logger.info(f"Loaded {s3_location.key} from object-store cache")
+                return True
+            self.logger.warning(
+                f"Cached object {cache_key} is empty; ignoring it and re-pulling from source"
+            )
+
         try:
             # Create parent directories
             local_path.parent.mkdir(parents=True, exist_ok=True)
-            
+
             # Download with requester pays
             self.s3_client.download_file(
                 Bucket=s3_location.bucket,
@@ -116,10 +147,20 @@ class HistoricalDataCollector:
                 Filename=str(local_path),
                 ExtraArgs={'RequestPayer': settings.request_payer}
             )
-            
+
             self.logger.info(f"Downloaded {s3_location.bucket}/{s3_location.key} to {local_path}")
+
+            # Write-back: cache the raw object so future pulls skip the AWS bill.
+            # Skip empty files so we never poison the cache with a 0-byte object.
+            if self.object_store and local_path.exists() and local_path.stat().st_size > 0:
+                if not self.object_store.put_file(local_path, cache_key):
+                    self.logger.warning(
+                        f"Failed to cache {s3_location.key} to object store; "
+                        "the next pull will hit the paid source again"
+                    )
+
             return True
-            
+
         except Exception as e:
             self.logger.error(f"Failed to download {s3_location.bucket}/{s3_location.key}: {e}")
             return False
@@ -368,6 +409,21 @@ class HistoricalDataCollector:
                     output_path = symbol_dir / f"{data_type}.parquet"
                     df.to_parquet(output_path)
                     self.logger.info(f"Saved {symbol} {data_type} data to {output_path}")
+
+                    # Mirror processed output to the object store. Key off the path
+                    # relative to the data root so the full layout (date range,
+                    # symbol, type) is preserved — using only output_dir.name would
+                    # flatten distinct runs (e.g. two "initial" backfills) onto one key.
+                    if self.object_store:
+                        try:
+                            rel = output_path.relative_to(self.local_data_path)
+                        except ValueError:
+                            rel = Path(output_dir.name) / symbol / f"{data_type}.parquet"
+                        key = f"processed/{rel}"
+                        if self.object_store.put_file(output_path, key):
+                            self.logger.info(f"Uploaded {symbol} {data_type} parquet to object store: {key}")
+                        else:
+                            self.logger.warning(f"Failed to mirror {symbol} {data_type} parquet to object store")
 
 
 async def main():
