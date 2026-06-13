@@ -28,6 +28,18 @@ class MarketDataPoint:
 
 
 @dataclass
+class GapEvent:
+    """A window of missed live data, detected after a reconnect."""
+    start: datetime
+    end: datetime
+    symbols: List[str]
+
+    @property
+    def seconds(self) -> float:
+        return (self.end - self.start).total_seconds()
+
+
+@dataclass
 class WebSocketConfig:
     """WebSocket connection configuration."""
     url: str
@@ -55,6 +67,8 @@ class HyperliquidWebSocketCollector:
         self.trades_buffer: Dict[str, deque] = {symbol: deque(maxlen=10000) for symbol in self.symbols}
         self.ticker_buffer: Dict[str, deque] = {symbol: deque(maxlen=1000) for symbol in self.symbols}
         self.funding_buffer: Dict[str, deque] = {symbol: deque(maxlen=100) for symbol in self.symbols}
+        # Per-asset context: mark/oracle/mid price, open interest, funding, premium.
+        self.asset_ctx_buffer: Dict[str, deque] = {symbol: deque(maxlen=1000) for symbol in self.symbols}
         
         # Connection state
         self.is_connected = False
@@ -71,6 +85,13 @@ class HyperliquidWebSocketCollector:
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=settings.websocket_queue_maxsize)
         self.dropped_count = 0
 
+        # Gap detection: callbacks fired with a GapEvent when a reconnect leaves
+        # a window of missed data. _last_disconnect_seen is the last message time
+        # before a drop, used to measure the gap on the next successful connect.
+        self.gap_callbacks: List[Callable[["GapEvent"], None]] = []
+        self.gap_threshold_seconds = settings.websocket_gap_threshold_seconds
+        self._last_disconnect_seen: Optional[datetime] = None
+
         # Performance tracking
         self.message_count = 0
         self.last_message_time = None
@@ -78,11 +99,18 @@ class HyperliquidWebSocketCollector:
         
     def add_data_callback(self, callback: Callable[[MarketDataPoint], None]):
         """Add a callback function to process incoming data.
-        
+
         Args:
             callback: Function that processes MarketDataPoint
         """
         self.data_callbacks.append(callback)
+
+    def add_gap_callback(self, callback: Callable[["GapEvent"], None]):
+        """Add a callback fired with a GapEvent when a reconnect leaves a gap.
+
+        The callback may be sync or async (an awaitable return is awaited).
+        """
+        self.gap_callbacks.append(callback)
     
     def create_subscriptions(self) -> List[Dict[str, Any]]:
         """Create WebSocket subscription messages.
@@ -119,6 +147,17 @@ class HyperliquidWebSocketCollector:
                 "type": "allMids"
             }
         })
+
+        # Subscribe to per-asset context (mark/oracle/mid price, open interest,
+        # funding, premium) for each symbol.
+        for symbol in self.symbols:
+            subscriptions.append({
+                "method": "subscribe",
+                "subscription": {
+                    "type": "activeAssetCtx",
+                    "coin": symbol
+                }
+            })
         
         # Subscribe to user events (if wallet configured)
         if settings.hyperliquid_wallet_address:
@@ -289,11 +328,118 @@ class HyperliquidWebSocketCollector:
             )
             
             return data_point
-            
+
         except Exception as e:
             self.logger.error(f"Error processing user message: {e}")
             return None
-    
+
+    def process_asset_ctx_message(self, message: Dict[str, Any]) -> Optional[MarketDataPoint]:
+        """Process an activeAssetCtx message: mark/oracle/mid price, open
+        interest, funding, premium, and the mark-vs-oracle basis.
+
+        Args:
+            message: WebSocket message
+
+        Returns:
+            MarketDataPoint or None
+        """
+        try:
+            data = message.get('data', {})
+            coin = data.get('coin')
+            if not coin or coin not in self.symbols:
+                return None
+
+            ctx = data.get('ctx') or {}
+
+            def _num(key):
+                value = ctx.get(key)
+                # Reject None and bools (float(True) == 1.0 would slip through).
+                if value is None or isinstance(value, bool):
+                    return None
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return None
+
+            mark = _num('markPx')
+            oracle = _num('oraclePx')
+            mid = _num('midPx')
+            open_interest = _num('openInterest')
+            funding = _num('funding')
+            premium = _num('premium')
+
+            # Nothing useful in this message (e.g. empty ctx) — skip it.
+            if all(v is None for v in (mark, oracle, mid, open_interest, funding, premium)):
+                return None
+
+            # Basis: how far the mark price sits from the oracle (index) price.
+            basis = None
+            basis_bps = None
+            if mark is not None and oracle is not None:
+                basis = mark - oracle
+                if oracle > 0:
+                    basis_bps = basis / oracle * 10000
+
+            timestamp = datetime.now(tz=timezone.utc)
+            ctx_data = {
+                'mark_price': mark,
+                'oracle_price': oracle,
+                'mid_price': mid,
+                'open_interest': open_interest,
+                'funding': funding,
+                'premium': premium,
+                'basis': basis,
+                'basis_bps': basis_bps,
+                'timestamp_ms': int(timestamp.timestamp() * 1000),
+            }
+
+            data_point = MarketDataPoint(
+                timestamp=timestamp,
+                symbol=coin,
+                data_type='asset_ctx',
+                data=ctx_data,
+            )
+
+            self.asset_ctx_buffer.setdefault(coin, deque(maxlen=1000)).append(data_point)
+            return data_point
+
+        except Exception as e:
+            self.logger.error(f"Error processing asset ctx message: {e}")
+            return None
+
+    def _record_disconnect(self):
+        """Remember the last message time at disconnect, to measure the next gap."""
+        self._last_disconnect_seen = self.last_message_time
+
+    async def _maybe_emit_gap(self, reconnected_at: datetime) -> Optional["GapEvent"]:
+        """Fire gap callbacks if the reconnect left a gap over the threshold.
+
+        Called once per successful (re)connect. Returns the GapEvent if one was
+        emitted, else None. Consumes _last_disconnect_seen so a gap fires once.
+        """
+        start = self._last_disconnect_seen
+        self._last_disconnect_seen = None
+        if start is None:
+            return None  # first connect, or we never received data before the drop
+
+        gap_seconds = (reconnected_at - start).total_seconds()
+        if gap_seconds < self.gap_threshold_seconds:
+            return None
+
+        event = GapEvent(start=start, end=reconnected_at, symbols=list(self.symbols))
+        self.logger.warning(
+            f"Detected {gap_seconds:.1f}s data gap after reconnect "
+            f"({start.isoformat()} -> {reconnected_at.isoformat()}); requesting backfill"
+        )
+        for callback in self.gap_callbacks:
+            try:
+                result = callback(event)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as e:
+                self.logger.error(f"Error in gap callback: {e}")
+        return event
+
     async def process_message(self, message_str: str):
         """Process incoming WebSocket message.
         
@@ -317,7 +463,12 @@ class HyperliquidWebSocketCollector:
             
             elif channel == 'allMids':
                 data_points.extend(self.process_ticker_message(message))
-            
+
+            elif channel == 'activeAssetCtx':
+                data_point = self.process_asset_ctx_message(message)
+                if data_point:
+                    data_points.append(data_point)
+
             elif channel == 'user':
                 data_point = self.process_user_message(message)
                 if data_point:
@@ -400,19 +551,22 @@ class HyperliquidWebSocketCollector:
                 self.connection_start_time = datetime.now(tz=timezone.utc)
                 
                 self.logger.info("WebSocket connected successfully")
-                
+
+                # If a prior connection dropped, measure the gap and fire backfill.
+                await self._maybe_emit_gap(self.connection_start_time)
+
                 # Send subscriptions
                 subscriptions = self.create_subscriptions()
                 for subscription in subscriptions:
                     await self.send_subscription(websocket, subscription)
                     await asyncio.sleep(0.1)  # Small delay between subscriptions
-                
+
                 self.logger.info(f"Sent {len(subscriptions)} subscriptions")
-                
+
                 # Listen for messages
                 async for message in websocket:
                     await self.process_message(message)
-                    
+
         except websockets.exceptions.ConnectionClosed:
             self.logger.warning("WebSocket connection closed")
         except Exception as e:
@@ -420,6 +574,8 @@ class HyperliquidWebSocketCollector:
         finally:
             self.is_connected = False
             self.websocket = None
+            # Remember when data stopped, so the next connect can size the gap.
+            self._record_disconnect()
     
     async def start_with_reconnect(self):
         """Start WebSocket collector with automatic reconnection.
@@ -462,6 +618,8 @@ class HyperliquidWebSocketCollector:
             buffer = self.trades_buffer.get(symbol, deque())
         elif data_type == 'ticker':
             buffer = self.ticker_buffer.get(symbol, deque())
+        elif data_type == 'asset_ctx':
+            buffer = self.asset_ctx_buffer.get(symbol, deque())
         else:
             return []
         
@@ -496,7 +654,8 @@ class HyperliquidWebSocketCollector:
             buffer_sizes[symbol] = {
                 'orderbook': len(self.orderbook_buffer.get(symbol, [])),
                 'trades': len(self.trades_buffer.get(symbol, [])),
-                'ticker': len(self.ticker_buffer.get(symbol, []))
+                'ticker': len(self.ticker_buffer.get(symbol, [])),
+                'asset_ctx': len(self.asset_ctx_buffer.get(symbol, []))
             }
         
         return {

@@ -370,7 +370,10 @@ class DataProcessor:
         self.ohlcv_processor = OHLCVProcessor()
         self.orderbook_processor = OrderBookProcessor()
         self.technical_processor = TechnicalIndicatorProcessor()
-        
+        # Latest per-symbol asset context (mark/oracle/OI/funding/basis), folded
+        # into the processed point so it lands in the DB, not just JSONL.
+        self.latest_asset_ctx: Dict[str, Dict[str, Any]] = {}
+
         self.logger = logger.bind(component="data_processor")
         
         # Processing callbacks
@@ -396,7 +399,9 @@ class DataProcessor:
                 self.ohlcv_processor.add_trade(data_point)
             elif data_point.data_type == 'orderbook':
                 self.orderbook_processor.update_orderbook(data_point)
-            
+            elif data_point.data_type == 'asset_ctx':
+                self.latest_asset_ctx[data_point.symbol] = data_point.data
+
             # Generate processed data every minute for trades
             if data_point.data_type == 'trade':
                 await self._process_symbol_data(data_point.symbol, data_point.timestamp)
@@ -424,6 +429,8 @@ class DataProcessor:
                 self.technical_processor.update_price_data(symbol, ohlcv)
                 technical_indicators = self.technical_processor.calculate_indicators(symbol)
             
+            asset_ctx = self.latest_asset_ctx.get(symbol)
+
             # Create processed data point
             processed_data = ProcessedData(
                 symbol=symbol,
@@ -433,7 +440,7 @@ class DataProcessor:
                 orderbook_metrics=orderbook_metrics,
                 technical_indicators=technical_indicators
             )
-            
+
             # Store processed data
             processed_data_point = MarketDataPoint(
                 timestamp=timestamp,
@@ -442,7 +449,8 @@ class DataProcessor:
                 data={
                     'ohlcv': ohlcv,
                     'orderbook_metrics': orderbook_metrics,
-                    'technical_indicators': technical_indicators
+                    'technical_indicators': technical_indicators,
+                    'asset_ctx': asset_ctx
                 }
             )
             
