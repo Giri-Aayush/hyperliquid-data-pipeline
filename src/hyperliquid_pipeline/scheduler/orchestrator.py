@@ -185,16 +185,24 @@ class DataPipelineOrchestrator:
         )
 
     async def _replay_point(self, point):
-        """Route a backfilled point through the same path as live data."""
+        """Persist a backfilled (past) point: validate, store, and log it.
+
+        Deliberately does NOT run it through data_processor.process_market_data.
+        That processor holds live, present-stream state (the OHLCV buffer and
+        rolling indicators); replaying a stale trade into it would corrupt the
+        current candle and races the live consumer's ordering. A recovered trade
+        belongs to a past window, so we just record it (storage + JSONL).
+        """
         validated = self.validation_callback(point) if self.validation_callback else point
-        if validated:
-            if self.data_processor:
-                await self.data_processor.process_market_data(validated)
-            if self.data_logger:
-                self.data_logger.log_data_point(validated)
-            # Count backfilled points like live ones so stats/health stay accurate.
-            self.stats['messages_processed'] += 1
-            self.stats['last_data_time'] = datetime.now(timezone.utc)
+        if not validated:
+            return
+        if self.storage:
+            await self.storage.store_data_point(validated)
+        if self.data_logger:
+            self.data_logger.log_data_point(validated)
+        # Count backfilled points so stats/health stay accurate.
+        self.stats['messages_processed'] += 1
+        self.stats['last_data_time'] = datetime.now(timezone.utc)
 
     async def _attempt_backfill(self, gap: GapEvent) -> int:
         """Try to backfill one gap; returns points recovered (0 = not yet in archive)."""

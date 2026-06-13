@@ -114,19 +114,25 @@ def test_retry_drops_aged_out_gaps():
     assert orch.historical_collector.calls == 0  # not even attempted
 
 
-def test_replay_point_routes_through_processor_and_logger():
+def test_replay_point_stores_and_logs_without_touching_live_processor():
     orch = DataPipelineOrchestrator()
     orch.validation_callback = None
-    processed, logged = [], []
+    stored, logged, processed = [], [], []
+
+    class _Store:
+        async def store_data_point(self, p):
+            stored.append(p)
+            return True
 
     class _Proc:
         async def process_market_data(self, p):
-            processed.append(p)
+            processed.append(p)  # must NOT be called for backfilled points
 
     class _Logger:
         def log_data_point(self, p):
             logged.append(p)
 
+    orch.storage = _Store()
     orch.data_processor = _Proc()
     orch.data_logger = _Logger()
 
@@ -137,4 +143,5 @@ def test_replay_point_routes_through_processor_and_logger():
         data={"price": 100.0, "size": 1.0, "backfilled": True},
     )
     asyncio.run(orch._replay_point(point))
-    assert len(processed) == 1 and len(logged) == 1
+    assert len(stored) == 1 and len(logged) == 1
+    assert processed == []  # live aggregator left untouched by past data
