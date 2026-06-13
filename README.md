@@ -33,6 +33,37 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 | INFO | Received ticker for BTC
 ```
 
+## Examples
+
+Two runnable scripts in [`examples/`](examples) that show the analytical output, not just the plumbing.
+
+**Live orderbook microstructure** — spread, depth, and imbalance off each snapshot:
+
+```bash
+python examples/orderbook_metrics.py --symbol BTC --duration 30
+```
+
+```
+time                mid  spread(bps)   imbalance       depth@5 bid/ask
+----------------------------------------------------------------------
+15:13:24    63,773.50         0.16      +0.670      23.80 / 1.88
+15:13:25    63,773.50         0.16      +0.660      23.80 / 1.88
+```
+
+**Indicator engine** — RSI, EMAs, and Bollinger bands over a price series (deterministic, no network):
+
+```bash
+python examples/ohlcv_indicators.py
+```
+
+```
+ bar       close     rsi      ema_10    bb_upper    bb_lower
+------------------------------------------------------------
+  30   48,325.73     4.4   48,699.66   50,189.33   48,101.03
+  50   48,335.55    60.3   48,146.32   48,304.05   47,923.26
+  60   48,517.08    70.2   48,383.43   48,582.64   47,864.89
+```
+
 ## What's in it
 
 | Module | Does |
