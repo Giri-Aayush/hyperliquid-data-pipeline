@@ -184,3 +184,37 @@ class TestTechnicalIndicators:
         assert indicators["sma_10"] == pytest.approx(sum(range(150, 160)) / 10)
         assert indicators["rsi"] == 100  # strictly increasing series
         assert indicators["price_change"] == pytest.approx(1.0)
+
+
+def test_add_trade_evicts_aged_out_trades():
+    """add_trade keeps a time-bounded deque, not an ever-growing list."""
+    from collections import deque
+
+    proc = OHLCVProcessor(retention=timedelta(seconds=60))
+    now = datetime.now(timezone.utc)
+    proc.add_trade(make_trade("BTC", 100.0, 1.0, now - timedelta(seconds=120)))  # too old
+    proc.add_trade(make_trade("BTC", 101.0, 1.0, now))                           # fresh
+
+    buf = proc.trade_buffers["BTC"]
+    assert isinstance(buf, deque)
+    assert len(buf) == 1
+    assert buf[0].data["price"] == 101.0
+
+
+def test_generate_ohlcv_handles_out_of_order_trades():
+    """A late, out-of-window trade appended after in-window trades must not
+    drop the in-window ones (regression: an early-break scan did exactly that)."""
+    proc = OHLCVProcessor()
+    now = datetime.now(timezone.utc)
+    proc.add_trade(make_trade("BTC", 100.0, 1.0, now - timedelta(seconds=40)))
+    proc.add_trade(make_trade("BTC", 110.0, 1.0, now - timedelta(seconds=20)))
+    proc.add_trade(make_trade("BTC", 120.0, 2.0, now - timedelta(seconds=5)))
+    # arrives late and is older than the 1m window, but newer than retention
+    proc.add_trade(make_trade("BTC", 999.0, 1.0, now - timedelta(seconds=200)))
+
+    ohlcv = proc.generate_ohlcv("BTC", "1m", end_time=now)
+    assert ohlcv is not None
+    assert ohlcv["count"] == 3
+    assert ohlcv["open"] == 100.0
+    assert ohlcv["close"] == 120.0
+    assert ohlcv["volume"] == 4.0
