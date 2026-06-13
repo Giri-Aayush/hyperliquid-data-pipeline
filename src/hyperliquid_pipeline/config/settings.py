@@ -55,6 +55,10 @@ class Settings(BaseSettings):
     historical_start_date: str = Field(default="2023-01-01")
     real_time_enabled: bool = Field(default=True)
     websocket_reconnect_delay: int = Field(default=5)
+    # Bounded hand-off queue between the socket read loop and the processing
+    # callbacks. If consumers fall behind under load, the oldest points are
+    # dropped (and counted) so the socket is always drained promptly.
+    websocket_queue_maxsize: int = Field(default=10000)
     
     # Logging
     log_level: str = Field(default="INFO")

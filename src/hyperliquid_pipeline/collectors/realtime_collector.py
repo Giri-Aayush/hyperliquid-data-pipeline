@@ -1,6 +1,7 @@
 """Real-time data collector for Hyperliquid WebSocket feeds."""
 
 import asyncio
+import inspect
 import json
 import websockets
 from pathlib import Path
@@ -62,7 +63,14 @@ class HyperliquidWebSocketCollector:
         
         # Callbacks for data processing
         self.data_callbacks: List[Callable[[MarketDataPoint], None]] = []
-        
+
+        # Bounded hand-off queue: the socket read loop only parses and enqueues,
+        # a separate consumer task runs the callbacks. This keeps a slow callback
+        # (disk flush, DB write) from ever stalling the socket. On overflow the
+        # oldest points are dropped so the freshest data always gets through.
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=settings.websocket_queue_maxsize)
+        self.dropped_count = 0
+
         # Performance tracking
         self.message_count = 0
         self.last_message_time = None
@@ -315,14 +323,11 @@ class HyperliquidWebSocketCollector:
                 if data_point:
                     data_points.append(data_point)
             
-            # Call data callbacks
+            # Hand off to the processing queue. The consumer task runs the
+            # callbacks, so a slow callback can never stall the socket read loop.
             for data_point in data_points:
-                for callback in self.data_callbacks:
-                    try:
-                        callback(data_point)
-                    except Exception as e:
-                        self.logger.error(f"Error in data callback: {e}")
-            
+                self._enqueue(data_point)
+
             # Update metrics
             self.message_count += len(data_points)
             self.last_message_time = datetime.now(tz=timezone.utc)
@@ -332,6 +337,52 @@ class HyperliquidWebSocketCollector:
         except Exception as e:
             self.logger.error(f"Error processing message: {e}")
     
+    def _enqueue(self, data_point: MarketDataPoint):
+        """Put a data point on the processing queue, dropping the oldest if full.
+
+        Called from the socket read loop, so it never blocks: when the queue is
+        full we discard the oldest queued point to make room for the newest,
+        keeping latency bounded and the socket drained. Drops are counted.
+        """
+        try:
+            self._queue.put_nowait(data_point)
+        except asyncio.QueueFull:
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+            except asyncio.QueueEmpty:
+                pass
+            self.dropped_count += 1
+            if self.dropped_count % 1000 == 1:
+                self.logger.warning(
+                    f"Processing queue full; dropping oldest data points "
+                    f"(total dropped: {self.dropped_count})"
+                )
+            try:
+                self._queue.put_nowait(data_point)
+            except asyncio.QueueFull:
+                pass
+
+    async def _consume(self):
+        """Drain the queue and run the callbacks, off the socket read loop.
+
+        Callbacks may be sync or return an awaitable; awaitables are awaited
+        here (serially) so storage writes apply backpressure to the queue, not
+        to the socket. A failing callback is logged and never stops the loop.
+        """
+        while True:
+            data_point = await self._queue.get()
+            try:
+                for callback in self.data_callbacks:
+                    try:
+                        result = callback(data_point)
+                        if inspect.isawaitable(result):
+                            await result
+                    except Exception as e:
+                        self.logger.error(f"Error in data callback: {e}")
+            finally:
+                self._queue.task_done()
+
     async def connect(self):
         """Establish WebSocket connection and subscribe to feeds."""
         try:
@@ -371,16 +422,28 @@ class HyperliquidWebSocketCollector:
             self.websocket = None
     
     async def start_with_reconnect(self):
-        """Start WebSocket collector with automatic reconnection."""
-        while True:
+        """Start WebSocket collector with automatic reconnection.
+
+        The consumer task runs for the whole session (across reconnects) and is
+        cancelled when this coroutine is stopped or cancelled.
+        """
+        consumer = asyncio.create_task(self._consume())
+        try:
+            while True:
+                try:
+                    await self.connect()
+                except Exception as e:
+                    self.logger.error(f"Connection failed: {e}")
+
+                if not self.is_connected:
+                    self.logger.info(f"Reconnecting in {settings.websocket_reconnect_delay} seconds...")
+                    await asyncio.sleep(settings.websocket_reconnect_delay)
+        finally:
+            consumer.cancel()
             try:
-                await self.connect()
-            except Exception as e:
-                self.logger.error(f"Connection failed: {e}")
-            
-            if not self.is_connected:
-                self.logger.info(f"Reconnecting in {settings.websocket_reconnect_delay} seconds...")
-                await asyncio.sleep(settings.websocket_reconnect_delay)
+                await consumer
+            except asyncio.CancelledError:
+                pass
     
     def get_recent_data(self, symbol: str, data_type: str, limit: int = 100) -> List[MarketDataPoint]:
         """Get recent data from buffers.
@@ -441,6 +504,9 @@ class HyperliquidWebSocketCollector:
             'uptime_seconds': uptime,
             'message_count': self.message_count,
             'last_message_time': self.last_message_time,
+            'queue_depth': self._queue.qsize(),
+            'queue_maxsize': self._queue.maxsize,
+            'dropped_count': self.dropped_count,
             'buffer_sizes': buffer_sizes,
             'symbols': self.symbols
         }
