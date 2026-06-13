@@ -266,7 +266,8 @@ class HistoricalDataCollector:
         start_date: str,
         end_date: Optional[str] = None,
         data_types: List[str] = None,
-        max_workers: int = 4
+        max_workers: int = 4,
+        hours: Optional[List[int]] = None
     ) -> Dict[str, Dict[str, pd.DataFrame]]:
         """Download historical data for multiple symbols and dates.
         
@@ -291,8 +292,9 @@ class HistoricalDataCollector:
             for date_str in self.generate_date_range(start_date, end_date):
                 for data_type in data_types:
                     if data_type in ['l2Book', 'trades']:
-                        # Market data available hourly
-                        for hour in range(24):
+                        # Market data available hourly; restrict to specific hours
+                        # when given (gap backfill only needs the gap's hours).
+                        for hour in (hours if hours is not None else range(24)):
                             requests.append(HistoricalDataRequest(
                                 symbol=symbol,
                                 date=date_str,

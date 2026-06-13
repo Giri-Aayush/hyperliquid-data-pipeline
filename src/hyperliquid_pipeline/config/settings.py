@@ -55,6 +55,15 @@ class Settings(BaseSettings):
     historical_start_date: str = Field(default="2023-01-01")
     real_time_enabled: bool = Field(default=True)
     websocket_reconnect_delay: int = Field(default=5)
+    # Minimum reconnect gap (seconds) worth backfilling from the archive. Tiny
+    # gaps aren't worth a requester-pays pull and the archive won't have them yet.
+    websocket_gap_threshold_seconds: float = Field(default=5.0)
+    # How long to keep retrying a gap backfill before giving up (the archive
+    # publishes with a lag, so a fresh gap often can't be filled immediately).
+    gap_backfill_max_age_seconds: float = Field(default=86400.0)
+    # Cap on queued gaps awaiting backfill, so a sustained archive outage with a
+    # flapping socket can't grow the queue without bound (drops oldest).
+    gap_max_pending: int = Field(default=1000)
     # Bounded hand-off queue between the socket read loop and the processing
     # callbacks. If consumers fall behind under load, the oldest points are
     # dropped (and counted) so the socket is always drained promptly.

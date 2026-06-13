@@ -3,6 +3,7 @@
 import asyncio
 import signal
 import sys
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any
 from pathlib import Path
@@ -14,7 +15,8 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from ..config import settings
 from ..collectors.historical_collector import HistoricalDataCollector
-from ..collectors.realtime_collector import HyperliquidWebSocketCollector, DataLogger
+from ..collectors.realtime_collector import HyperliquidWebSocketCollector, DataLogger, GapEvent
+from ..collectors.backfill import backfill_gap
 from ..processors.data_processor import DataProcessor, create_storage_backends
 from ..utils.validation import ValidationCallback
 from ..storage.database import DataStorage
@@ -36,6 +38,10 @@ class DataPipelineOrchestrator:
         self.data_logger: Optional[DataLogger] = None
         self.validation_callback: Optional[ValidationCallback] = None
         
+        # Reconnect gaps the archive didn't have yet, awaiting retry. Bounded so
+        # a sustained outage with a flapping socket can't grow it without bound.
+        self.pending_gaps: "deque[GapEvent]" = deque(maxlen=settings.gap_max_pending)
+
         # State tracking
         self.is_running = False
         self.start_time: Optional[datetime] = None
@@ -100,11 +106,15 @@ class DataPipelineOrchestrator:
                     self.logger.error(f"Error in data callback: {e}")
             
             self.realtime_collector.add_data_callback(validated_data_callback)
-            
+
             # Initialize data logger for raw data backup
             self.data_logger = DataLogger()
             self.realtime_collector.add_data_callback(self.data_logger.log_data_point)
-            
+
+            # On a reconnect gap, queue it (fast, synchronous — never blocks the
+            # socket). The periodic retry job does the actual archive backfill.
+            self.realtime_collector.add_gap_callback(self._queue_gap)
+
             # Initialize scheduler
             self.scheduler = AsyncIOScheduler()
             self._setup_scheduled_jobs()
@@ -164,6 +174,74 @@ class DataPipelineOrchestrator:
             name='Statistics Logging',
             max_instances=1
         )
+
+        # Retry gap backfills the archive didn't have yet (it publishes with a lag).
+        self.scheduler.add_job(
+            self._retry_pending_gaps,
+            trigger=IntervalTrigger(minutes=15),
+            id='gap_backfill_retry',
+            name='Reconnect Gap Backfill Retry',
+            max_instances=1
+        )
+
+    async def _replay_point(self, point):
+        """Route a backfilled point through the same path as live data."""
+        validated = self.validation_callback(point) if self.validation_callback else point
+        if validated:
+            if self.data_processor:
+                await self.data_processor.process_market_data(validated)
+            if self.data_logger:
+                self.data_logger.log_data_point(validated)
+            # Count backfilled points like live ones so stats/health stay accurate.
+            self.stats['messages_processed'] += 1
+            self.stats['last_data_time'] = datetime.now(timezone.utc)
+
+    async def _attempt_backfill(self, gap: GapEvent) -> int:
+        """Try to backfill one gap; returns points recovered (0 = not yet in archive)."""
+        if not self.historical_collector:
+            return 0
+        try:
+            return await backfill_gap(self.historical_collector, gap, self._replay_point)
+        except Exception as e:
+            self.logger.error(f"Gap backfill errored for {gap.start} -> {gap.end}: {e}")
+            return 0
+
+    def _queue_gap(self, gap: GapEvent):
+        """Gap callback: queue the gap for the retry job to backfill.
+
+        Synchronous and fast so it never blocks the socket. The archive lags
+        real time anyway, so a fresh gap usually can't be filled immediately —
+        the periodic retry job handles it once the data lands.
+        """
+        self.pending_gaps.append(gap)  # bounded deque; drops oldest if saturated
+        self.logger.info(
+            f"Queued gap {gap.start.isoformat()} -> {gap.end.isoformat()} for backfill "
+            f"({len(self.pending_gaps)} pending)"
+        )
+
+    async def _retry_pending_gaps(self):
+        """Re-attempt queued gaps; drop ones that succeed or age past the limit.
+
+        Takes ownership of the current queue up front and re-appends failures, so
+        gaps detected concurrently (during the awaits) land in the fresh queue and
+        are never overwritten.
+        """
+        if not self.pending_gaps:
+            return
+        batch = list(self.pending_gaps)
+        self.pending_gaps.clear()
+        now = datetime.now(timezone.utc)
+        max_age = settings.gap_backfill_max_age_seconds
+        for gap in batch:
+            if (now - gap.end).total_seconds() > max_age:
+                self.logger.warning(
+                    f"Giving up on gap {gap.start.isoformat()} -> {gap.end.isoformat()} "
+                    f"(older than {max_age:.0f}s, never appeared in the archive)"
+                )
+                continue
+            recovered = await self._attempt_backfill(gap)
+            if recovered == 0:
+                self.pending_gaps.append(gap)
     
     async def _collect_historical_data(self):
         """Scheduled historical data collection."""
