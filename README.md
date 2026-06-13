@@ -83,6 +83,20 @@ trades                60
 
 The engine has **no lookahead** (a signal from bar *i*'s close is acted on at *i+1*), charges fees and slippage on every position change, and supports long/short/flat. Point it at real data with `backtest.data.from_csv(...)` or `from_trades_parquet(...)` (the Parquet this pipeline writes). See [Backtesting](#backtesting).
 
+## What the data shows
+
+To show the pipeline captures real market activity, here is a six-minute live capture of BTC perps (2026-06-13, 18:51–18:57 UTC): 663 orderbook snapshots, 800 trades, and the per-second mark, oracle, and book metrics the pipeline computes. Regenerate it with `python examples/analyze_btc_capture.py`.
+
+![BTC perps microstructure over a six-minute live capture](docs/btc-microstructure.png)
+
+Three things stood out in this window. It's a short sample, not a study, but every number is real:
+
+- **The perp traded at a steady discount to the index.** The mark price sat 3.9 to 5.9 bps below the oracle (index) price for the whole six minutes (mean -4.9 bps) and never crossed above it. A persistent negative mark-minus-oracle basis tends to move with funding pressure, and it's exactly what the `activeAssetCtx` feed and the computed basis exist to surface.
+- **The book is tight and stable.** Median spread was 0.16 bps (about $1 on a ~$64,100 mid), and the 95th percentile was the same, so the quoted top of book barely moved for almost the whole window. The few brief widenings show up as the spikes in the spread panel.
+- **Orderbook imbalance flips fast, and didn't cleanly lead price here.** It swung between strongly bid- and ask-heavy on a seconds timescale (mean +0.24, average magnitude 0.57) while the mid drifted up about 8 bps. Over six minutes I wouldn't read that as predictive; it's a reminder that a microstructure signal needs far more than a short window to judge.
+
+The chart and a summary JSON come from [`examples/analyze_btc_capture.py`](examples/analyze_btc_capture.py), so you can point it at a longer window or another symbol and redraw it.
+
 ## What's in it
 
 | Module | Does |
