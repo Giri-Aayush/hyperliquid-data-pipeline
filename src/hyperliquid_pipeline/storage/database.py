@@ -2,6 +2,7 @@
 
 import asyncio
 from abc import ABC, abstractmethod
+from collections import deque
 from typing import List, Dict, Any, Optional
 import pandas as pd
 from datetime import datetime, timezone
@@ -522,3 +523,141 @@ class MultiStorage(DataStorage):
             *[storage.close() for storage in self.storages],
             return_exceptions=True
         )
+
+
+class BatchingStorage(DataStorage):
+    """Buffers writes and flushes them as batches, off the ingest hot path.
+
+    Wraps another DataStorage (typically MultiStorage). ``store_data_point``
+    appends to an in-memory buffer and returns immediately; the buffer is
+    flushed to the inner store when it reaches ``batch_size`` or every
+    ``flush_interval`` seconds via a background task. This turns one DB
+    round-trip per point into one per batch — the difference between keeping up
+    with a busy market and falling behind.
+    """
+
+    def __init__(
+        self,
+        inner: DataStorage,
+        batch_size: int = 500,
+        flush_interval: float = 1.0,
+        max_buffer: int = 50_000,
+    ):
+        self.inner = inner
+        self.batch_size = batch_size
+        self.flush_interval = flush_interval
+        self.max_buffer = max_buffer
+        # deque so overflow eviction (popleft) is O(1).
+        self._buffer: "deque[MarketDataPoint]" = deque()
+        self._lock = asyncio.Lock()
+        self._stop = asyncio.Event()
+        self._flush_task: Optional[asyncio.Task] = None
+        self._closed = False
+        self.dropped_count = 0
+        self.logger = logger.bind(component="batching_storage")
+
+    async def initialize(self):
+        """Initialize the inner store and start the periodic flush task."""
+        await self.inner.initialize()
+        self.start()
+
+    def start(self):
+        """Start the periodic flush task. Call from within a running event loop."""
+        if self._flush_task is None and not self._closed:
+            self._flush_task = asyncio.create_task(self._flush_loop())
+
+    async def _flush_loop(self):
+        # Sleep on the stop event so close() can wake us immediately, and so we
+        # never get cancelled mid-write (which would lose the in-flight batch).
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self.flush_interval)
+            except asyncio.TimeoutError:
+                pass
+            await self.flush()
+
+    def _enforce_cap_locked(self):
+        """Drop oldest points if the buffer is over capacity. Caller holds the lock."""
+        over = len(self._buffer) - self.max_buffer
+        if over > 0:
+            for _ in range(over):
+                self._buffer.popleft()
+            self.dropped_count += over
+            if self.dropped_count % 10_000 < over:
+                self.logger.warning(
+                    f"Storage buffer over {self.max_buffer}; dropping oldest points "
+                    f"(total dropped: {self.dropped_count}) — is the database keeping up?"
+                )
+
+    async def store_data_point(self, data_point: MarketDataPoint) -> bool:
+        if self._closed:
+            return False
+        async with self._lock:
+            self._buffer.append(data_point)
+            self._enforce_cap_locked()
+            full = len(self._buffer) >= self.batch_size
+        if full:
+            await self.flush()
+        return True
+
+    async def store_data_points(self, data_points: List[MarketDataPoint]) -> int:
+        if self._closed:
+            return 0
+        async with self._lock:
+            self._buffer.extend(data_points)
+            self._enforce_cap_locked()
+            full = len(self._buffer) >= self.batch_size
+        if full:
+            await self.flush()
+        return len(data_points)
+
+    async def flush(self):
+        """Write the buffered points to the inner store as a single batch.
+
+        On failure the batch is put back at the front of the buffer so the next
+        flush retries it, rather than silently dropping data; the buffer cap then
+        bounds memory if the backend stays down.
+        """
+        async with self._lock:
+            if not self._buffer:
+                return
+            batch = list(self._buffer)
+            self._buffer.clear()
+        try:
+            await self.inner.store_data_points(batch)
+        except Exception as e:
+            async with self._lock:
+                self._buffer.extendleft(reversed(batch))  # restore original order at front
+                self._enforce_cap_locked()
+            self.logger.error(f"Batch flush failed, re-queued {len(batch)} points for retry: {e}")
+
+    async def get_data(
+        self,
+        symbol: str,
+        data_type: str,
+        start_time: datetime,
+        end_time: datetime
+    ) -> List[MarketDataPoint]:
+        """Flush pending writes, then read through to the inner store."""
+        await self.flush()
+        return await self.inner.get_data(symbol, data_type, start_time, end_time)
+
+    async def close(self):
+        """Stop the flush task gracefully, flush the tail, and close the inner store.
+
+        Idempotent. Signals the loop to stop (rather than cancelling it
+        mid-write, which would lose the in-flight batch), waits for it to finish,
+        then does a final flush.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._stop.set()
+        if self._flush_task is not None:
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
+            self._flush_task = None
+        await self.flush()
+        await self.inner.close()

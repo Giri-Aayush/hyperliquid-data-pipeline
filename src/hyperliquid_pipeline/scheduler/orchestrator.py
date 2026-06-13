@@ -17,7 +17,7 @@ from ..collectors.historical_collector import HistoricalDataCollector
 from ..collectors.realtime_collector import HyperliquidWebSocketCollector, DataLogger
 from ..processors.data_processor import DataProcessor, create_storage_backends
 from ..utils.validation import ValidationCallback
-from ..storage.database import MultiStorage
+from ..storage.database import DataStorage
 
 
 class DataPipelineOrchestrator:
@@ -31,7 +31,7 @@ class DataPipelineOrchestrator:
         self.historical_collector: Optional[HistoricalDataCollector] = None
         self.realtime_collector: Optional[HyperliquidWebSocketCollector] = None
         self.data_processor: Optional[DataProcessor] = None
-        self.storage: Optional[MultiStorage] = None
+        self.storage: Optional[DataStorage] = None
         self.scheduler: Optional[AsyncIOScheduler] = None
         self.data_logger: Optional[DataLogger] = None
         self.validation_callback: Optional[ValidationCallback] = None

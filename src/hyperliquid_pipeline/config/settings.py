@@ -59,6 +59,14 @@ class Settings(BaseSettings):
     # callbacks. If consumers fall behind under load, the oldest points are
     # dropped (and counted) so the socket is always drained promptly.
     websocket_queue_maxsize: int = Field(default=10000)
+    # Storage writes are batched: flush when the buffer hits storage_batch_size
+    # or every storage_flush_interval seconds, whichever comes first. Turns one
+    # DB round-trip per point into one per batch.
+    storage_batch_size: int = Field(default=500)
+    storage_flush_interval: float = Field(default=1.0)
+    # Cap on the batching buffer. If the DB can't keep up, the oldest buffered
+    # points are dropped (and counted) past this, bounding memory.
+    storage_max_buffer: int = Field(default=50000)
     
     # Logging
     log_level: str = Field(default="INFO")
