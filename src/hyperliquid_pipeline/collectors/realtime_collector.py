@@ -3,17 +3,18 @@
 import asyncio
 import json
 import websockets
-import pandas as pd
+from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, List, Callable, Optional, Any
+from typing import Dict, List, Callable, Optional, Any, Tuple, TYPE_CHECKING
 from dataclasses import dataclass, asdict
 from loguru import logger
 import time
 from collections import deque
-import aiohttp
-import ssl
 
 from ..config import settings
+
+if TYPE_CHECKING:  # annotation only; runtime import is deferred to avoid a cycle
+    from ..storage.object_store import ObjectStore
 
 
 @dataclass
@@ -448,22 +449,54 @@ class HyperliquidWebSocketCollector:
 class DataLogger:
     """Logs market data to files."""
     
-    def __init__(self, output_dir: str = None):
+    def __init__(self, output_dir: str = None, object_store: "Optional[ObjectStore]" = None):
         """Initialize data logger.
-        
+
         Args:
             output_dir: Directory to save data files
+            object_store: optional S3-compatible sink for finished JSONL files;
+                defaults to the configured store. Pass explicitly in tests.
         """
         self.output_dir = Path(output_dir) if output_dir else settings.real_time_data_path
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # File handles for different data types
+
+        # Open file handle per filepath, plus the current filepath per
+        # (symbol, data_type) so a date rollover can finalize the prior day.
         self.file_handles = {}
+        self._current: Dict[Tuple[str, str], Path] = {}
         self.logger = logger.bind(component="data_logger")
-    
+
+        if object_store is not None:
+            self.object_store = object_store
+        else:
+            from ..storage.object_store import get_object_store  # deferred: import cycle
+            self.object_store = get_object_store()
+
+    def _object_key(self, filepath: Path) -> str:
+        """Object-store key for a JSONL file.
+
+        Namespaced by output_dir so two loggers writing different directories
+        don't collide on basename alone (uploads are whole-object overwrites).
+        """
+        return f"realtime/{self.output_dir.name}/{filepath.name}"
+
+    def _finalize_file(self, filepath: Path):
+        """Close a file's handle and mirror it to the object store, if configured."""
+        handle = self.file_handles.pop(filepath, None)
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        if self.object_store:
+            try:
+                self.object_store.put_file(filepath, self._object_key(filepath))
+            except Exception as e:
+                self.logger.error(f"Failed to upload {filepath} to object store: {e}")
+
     def log_data_point(self, data_point: MarketDataPoint):
         """Log a data point to file.
-        
+
         Args:
             data_point: MarketDataPoint to log
         """
@@ -472,29 +505,34 @@ class DataLogger:
             date_str = data_point.timestamp.strftime("%Y%m%d")
             filename = f"{data_point.symbol}_{data_point.data_type}_{date_str}.jsonl"
             filepath = self.output_dir / filename
-            
+
+            # On a date rollover, finalize and upload the completed day's file
+            # now, so a later crash can't lose an already-finished day.
+            stream = (data_point.symbol, data_point.data_type)
+            prev = self._current.get(stream)
+            if prev is not None and prev != filepath:
+                self._finalize_file(prev)
+
             # Open file if not already open
             if filepath not in self.file_handles:
                 self.file_handles[filepath] = open(filepath, 'a')
-            
+            self._current[stream] = filepath
+
             # Write data point as JSON line
             data_dict = asdict(data_point)
             data_dict['timestamp'] = data_point.timestamp.isoformat()
-            
+
             self.file_handles[filepath].write(json.dumps(data_dict) + '\n')
             self.file_handles[filepath].flush()
-            
+
         except Exception as e:
             self.logger.error(f"Error logging data point: {e}")
-    
+
     def close_all_files(self):
-        """Close all open file handles."""
-        for handle in self.file_handles.values():
-            try:
-                handle.close()
-            except:
-                pass
-        self.file_handles.clear()
+        """Close all open file handles, uploading each to the object store if configured."""
+        for filepath in list(self.file_handles.keys()):
+            self._finalize_file(filepath)
+        self._current.clear()
 
 
 async def main():
