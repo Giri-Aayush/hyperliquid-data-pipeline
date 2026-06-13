@@ -1,0 +1,20 @@
+{
+  "symbol": "BTC",
+  "captured_utc": [
+    "2026-06-13 18:51:36.241000+00:00",
+    "2026-06-13 18:57:34.710000+00:00"
+  ],
+  "duration_s": 360,
+  "orderbook_snapshots": 663,
+  "trades": 800,
+  "mid_first": 64064.5,
+  "mid_last": 64116.5,
+  "spread_bps_median": 0.15603666861712503,
+  "spread_bps_p95": 0.1560658910191883,
+  "imbalance_mean": 0.2384168478533287,
+  "imbalance_abs_mean": 0.569795727456368,
+  "basis_bps_min": -5.927682276229993,
+  "basis_bps_max": -3.899365183348151,
+  "basis_bps_mean": -4.872305082374584,
+  "open_interest_last": 31966.82318
+}
