@@ -512,30 +512,44 @@ class DataProcessor:
 
 
 async def create_storage_backends() -> MultiStorage:
-    """Create and initialize storage backends.
-    
+    """Create and initialize whichever storage backends are configured and reachable.
+
+    Every backend is optional: a backend that isn't configured is skipped, and one
+    that fails to connect is logged and skipped rather than crashing the pipeline.
+    With nothing configured/reachable you get an empty MultiStorage — the pipeline
+    still runs, and raw data is preserved by the DataLogger (JSONL, optionally to R2).
+
     Returns:
-        Initialized MultiStorage instance
+        Initialized MultiStorage instance (possibly with zero backends)
     """
     storages = []
-    
-    # Add Redis for caching
-    redis_storage = RedisStorage()
-    await redis_storage.initialize()
-    storages.append(redis_storage)
-    
-    # Add InfluxDB for time-series data
+
+    async def _try(name: str, storage: DataStorage):
+        try:
+            await storage.initialize()
+            storages.append(storage)
+        except Exception as e:
+            logger.warning(f"{name} storage unavailable, skipping: {e}")
+
+    # Redis cache — always attempted; initialize() pings and raises if Redis
+    # isn't reachable, in which case _try logs and skips it. Point REDIS_HOST at
+    # your instance to enable it.
+    await _try("Redis", RedisStorage())
+
+    # InfluxDB for time-series data
     if settings.influxdb_token:
-        influxdb_storage = InfluxDBStorage()
-        await influxdb_storage.initialize()
-        storages.append(influxdb_storage)
-    
-    # Add PostgreSQL for structured data
+        await _try("InfluxDB", InfluxDBStorage())
+
+    # PostgreSQL for structured data
     if settings.postgres_password:
-        postgres_storage = PostgreSQLStorage()
-        await postgres_storage.initialize()
-        storages.append(postgres_storage)
-    
+        await _try("PostgreSQL", PostgreSQLStorage())
+
+    if not storages:
+        logger.warning(
+            "No storage backends active — processed points won't be persisted to a DB. "
+            "Raw data is still written by the DataLogger. Configure Redis/Postgres/InfluxDB to enable."
+        )
+
     return MultiStorage(storages)
 
 

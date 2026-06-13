@@ -475,23 +475,28 @@ class MultiStorage(DataStorage):
     
     async def store_data_point(self, data_point: MarketDataPoint) -> bool:
         """Store data point to all backends."""
+        if not self.storages:
+            return False
         results = await asyncio.gather(
             *[storage.store_data_point(data_point) for storage in self.storages],
             return_exceptions=True
         )
-        
+
         success_count = sum(1 for result in results if result is True)
         return success_count > 0
-    
+
     async def store_data_points(self, data_points: List[MarketDataPoint]) -> int:
         """Store data points to all backends."""
+        if not self.storages:
+            return 0
         results = await asyncio.gather(
             *[storage.store_data_points(data_points) for storage in self.storages],
             return_exceptions=True
         )
-        
-        # Return the maximum count stored across all backends
-        return max(result for result in results if isinstance(result, int))
+
+        # Return the maximum count stored across all backends (0 if all failed)
+        counts = [result for result in results if isinstance(result, int)]
+        return max(counts) if counts else 0
     
     async def get_data(
         self, 
