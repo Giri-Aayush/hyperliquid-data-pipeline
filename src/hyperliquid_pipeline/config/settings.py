@@ -61,10 +61,22 @@ class Settings(BaseSettings):
     log_rotation: str = Field(default="1 day")
     log_retention: str = Field(default="30 days")
     
-    # S3 Archive Settings
+    # S3 Archive Settings (Hyperliquid's source bucket — AWS, requester-pays)
     hyperliquid_archive_bucket: str = Field(default="hyperliquid-archive")
     node_data_bucket: str = Field(default="hl-mainnet-node-data")
     request_payer: str = Field(default="requester")
+
+    # Object store (your own S3-compatible bucket: Cloudflare R2, AWS S3, Backblaze, MinIO).
+    # Used to cache raw archive pulls and store processed output. Zero egress on R2.
+    # backend: "auto" (S3 if a bucket is set, else disabled), "s3", "local", or "none".
+    object_store_backend: str = Field(default="auto")
+    object_store_endpoint_url: Optional[str] = None  # e.g. https://<acct>.r2.cloudflarestorage.com (blank = AWS S3)
+    object_store_bucket: Optional[str] = None
+    object_store_access_key_id: Optional[str] = None
+    object_store_secret_access_key: Optional[str] = None
+    object_store_region: str = Field(default="auto")  # R2 wants "auto"
+    object_store_prefix: str = Field(default="")  # optional key prefix, e.g. "hyperliquid/"
+    object_store_local_path: Path = Field(default=Path("./data/object_store"))
     
     class Config:
         """Pydantic config."""
@@ -98,6 +110,20 @@ class Settings(BaseSettings):
     def symbols_list(self) -> List[str]:
         """Get collect_symbols as a list."""
         return [s.strip() for s in self.collect_symbols.split(",")]
+
+    @property
+    def object_store_kind(self) -> str:
+        """Resolve which object-store backend to use: 's3', 'local', or 'none'.
+
+        "auto" -> 's3' when a bucket is configured, otherwise 'none'.
+        "r2" is accepted as a friendly alias for the S3-compatible client.
+        """
+        backend = (self.object_store_backend or "auto").strip().lower()
+        if backend == "auto":
+            return "s3" if self.object_store_bucket else "none"
+        if backend == "r2":  # Cloudflare R2 is just an S3-compatible endpoint
+            return "s3"
+        return backend
 
 
 # Global settings instance
