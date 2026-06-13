@@ -6,12 +6,13 @@ import numpy as np
 from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
+from collections import deque
 from loguru import logger
 import json
 from pathlib import Path
 
 from ..collectors.realtime_collector import MarketDataPoint
-from ..storage.database import DataStorage, MultiStorage, RedisStorage, InfluxDBStorage, PostgreSQLStorage
+from ..storage.database import DataStorage, MultiStorage, BatchingStorage, RedisStorage, InfluxDBStorage, PostgreSQLStorage
 from ..config import settings
 
 
@@ -30,14 +31,22 @@ class ProcessedData:
 class OHLCVProcessor:
     """Processes trade data into OHLCV candles."""
     
-    def __init__(self, timeframes: List[str] = None):
+    # Hard safety cap per symbol so a burst inside the retention window can't
+    # grow the buffer without bound; time-based eviction is the primary mechanism.
+    MAX_TRADES_PER_SYMBOL = 200_000
+
+    def __init__(self, timeframes: List[str] = None, retention: timedelta = timedelta(hours=1)):
         """Initialize OHLCV processor.
-        
+
         Args:
             timeframes: List of timeframes (e.g., ['1m', '5m', '1h'])
+            retention: how far back to keep trades for candle generation
         """
         self.timeframes = timeframes or ['1m', '5m', '15m', '1h', '4h', '1d']
-        self.trade_buffers: Dict[str, List[MarketDataPoint]] = {}
+        # deque per symbol: append-right on arrival, evict-left by age — O(1)
+        # amortized, instead of rebuilding a list on every trade.
+        self.trade_buffers: Dict[str, deque] = {}
+        self.retention = retention
         self.logger = logger.bind(component="ohlcv_processor")
     
     def _timeframe_to_seconds(self, timeframe: str) -> int:
@@ -62,19 +71,21 @@ class OHLCVProcessor:
         """
         if trade_data.data_type != 'trade':
             return
-        
+
         symbol = trade_data.symbol
-        if symbol not in self.trade_buffers:
-            self.trade_buffers[symbol] = []
-        
-        self.trade_buffers[symbol].append(trade_data)
-        
-        # Keep only last hour of trades
-        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=1)
-        self.trade_buffers[symbol] = [
-            trade for trade in self.trade_buffers[symbol]
-            if trade.timestamp > cutoff_time
-        ]
+        buffer = self.trade_buffers.get(symbol)
+        if buffer is None:
+            buffer = deque(maxlen=self.MAX_TRADES_PER_SYMBOL)
+            self.trade_buffers[symbol] = buffer
+
+        buffer.append(trade_data)
+
+        # Evict aged-out trades from the front. Trades arrive in time order, so
+        # this pops only the few that just expired — O(1) amortized per add,
+        # versus rebuilding the whole list (which was O(n) per trade -> O(n^2)).
+        cutoff_time = datetime.now(timezone.utc) - self.retention
+        while buffer and buffer[0].timestamp <= cutoff_time:
+            buffer.popleft()
     
     def generate_ohlcv(self, symbol: str, timeframe: str, end_time: datetime = None) -> Optional[Dict[str, float]]:
         """Generate OHLCV data for a symbol and timeframe.
@@ -95,13 +106,17 @@ class OHLCVProcessor:
         
         interval_seconds = self._timeframe_to_seconds(timeframe)
         start_time = end_time - timedelta(seconds=interval_seconds)
-        
-        # Filter trades in the time window
+
+        # Collect trades in [start, end). Scan the whole buffer rather than
+        # breaking early: exchange trade timestamps aren't strictly monotonic, so
+        # a late-arriving trade can sit out of order in the deque and an early
+        # break would silently drop in-window trades before it. The buffer is
+        # bounded by retention, and add_trade is now O(1), so this stays cheap.
         relevant_trades = [
             trade for trade in self.trade_buffers[symbol]
             if start_time <= trade.timestamp < end_time
         ]
-        
+
         if not relevant_trades:
             return None
         
@@ -511,7 +526,7 @@ class DataProcessor:
         self.logger.info("Completed bulk processing of historical data")
 
 
-async def create_storage_backends() -> MultiStorage:
+async def create_storage_backends() -> DataStorage:
     """Create and initialize whichever storage backends are configured and reachable.
 
     Every backend is optional: a backend that isn't configured is skipped, and one
@@ -519,8 +534,11 @@ async def create_storage_backends() -> MultiStorage:
     With nothing configured/reachable you get an empty MultiStorage — the pipeline
     still runs, and raw data is preserved by the DataLogger (JSONL, optionally to R2).
 
+    The backends are wrapped in a BatchingStorage so the hot path buffers writes
+    and flushes them in batches. Call ``close()`` on the result to flush the tail.
+
     Returns:
-        Initialized MultiStorage instance (possibly with zero backends)
+        A started BatchingStorage wrapping the active backends (possibly zero).
     """
     storages = []
 
@@ -549,8 +567,17 @@ async def create_storage_backends() -> MultiStorage:
             "No storage backends active — processed points won't be persisted to a DB. "
             "Raw data is still written by the DataLogger. Configure Redis/Postgres/InfluxDB to enable."
         )
+        # Nothing to batch to; skip the wrapper (and its background flush task).
+        return MultiStorage(storages)
 
-    return MultiStorage(storages)
+    batching = BatchingStorage(
+        MultiStorage(storages),
+        batch_size=settings.storage_batch_size,
+        flush_interval=settings.storage_flush_interval,
+        max_buffer=settings.storage_max_buffer,
+    )
+    batching.start()  # we're in a running loop here
+    return batching
 
 
 async def main():
