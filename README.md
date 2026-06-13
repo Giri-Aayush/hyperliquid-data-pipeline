@@ -4,12 +4,13 @@
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-Collects market data from Hyperliquid — both live over WebSocket and historical from the S3 archive — turns it into OHLCV candles, indicators, and orderbook metrics, and writes it to whichever store you point it at. I built it to feed my own backtests.
+Collects market data from Hyperliquid — both live over WebSocket and historical from the S3 archive — turns it into OHLCV candles, indicators, and orderbook metrics, writes it to whichever store you point it at, and **backtests strategies against it**. I built it to feed my own trading research.
 
 ```
  WebSocket (live) ─┐
-                   ├─▶  collect ──▶ process ──▶ validate ──▶  PostgreSQL · InfluxDB · Redis · Parquet
- S3 archive (past) ─┘                  │
+                   ├─▶  collect ──▶ process ──▶ validate ──▶  store ──▶  backtest
+ S3 archive (past) ─┘                  │                  (Postgres · InfluxDB    (strategy →
+                                       │                   · Redis · Parquet/R2)   Sharpe, PnL, DD)
                                        └── OHLCV · RSI/EMA/Bollinger · spread, depth, imbalance
 ```
 
@@ -35,7 +36,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 ## Examples
 
-Two runnable scripts in [`examples/`](examples) that show the analytical output, not just the plumbing.
+Three runnable scripts in [`examples/`](examples) that show the analytical output, not just the plumbing.
 
 **Live orderbook microstructure** — spread, depth, and imbalance off each snapshot:
 
@@ -64,6 +65,24 @@ python examples/ohlcv_indicators.py
   60   48,517.08    70.2   48,383.43   48,582.64   47,864.89
 ```
 
+**Backtest** — run a strategy over the collected OHLCV and report PnL, Sharpe, drawdown, win rate (deterministic, no network):
+
+```bash
+python examples/backtest_demo.py
+```
+
+```
+=== SMA 10/30 ===
+return           -35.53%
+Sharpe             -0.50
+max drawdown     -66.21%
+win rate          28.33%
+profit factor       1.02
+trades                60
+```
+
+The engine has **no lookahead** (a signal from bar *i*'s close is acted on at *i+1*), charges fees and slippage on every position change, and supports long/short/flat. Point it at real data with `backtest.data.from_csv(...)` or `from_trades_parquet(...)` (the Parquet this pipeline writes). See [Backtesting](#backtesting).
+
 ## What's in it
 
 | Module | Does |
@@ -75,6 +94,7 @@ python examples/ohlcv_indicators.py
 | `storage/database.py` | One interface, three DB backends: PostgreSQL (asyncpg), InfluxDB, Redis. Use any subset (each optional) |
 | `storage/object_store.py` | S3-compatible object store (Cloudflare R2 / AWS S3 / Backblaze / MinIO): caches raw pulls, stores Parquet output |
 | `scheduler/orchestrator.py` | APScheduler jobs for daily history pulls and quality reports; clean shutdown on signals |
+| `backtest/` | Run a strategy over the collected OHLCV: no-lookahead engine, fees + slippage, long/short, and a metrics report (Sharpe, Sortino, drawdown, win rate, profit factor, expectancy) |
 
 ## Running the full thing
 
@@ -126,10 +146,33 @@ src/hyperliquid_pipeline/
 ├── storage/       PostgreSQL, InfluxDB, Redis + S3/R2 object store
 ├── scheduler/     APScheduler orchestration
 ├── utils/         validation, quality reports
+├── backtest/      engine, strategies, metrics, OHLCV loaders
 └── config/        pydantic-settings (.env)
 scripts/run_pipeline.py   CLI: start · collect-historical · test-realtime
 tests/                    unit tests, no network
 ```
+
+## Backtesting
+
+Closes the loop: collect data with the pipeline, then test a strategy against it.
+
+```python
+from hyperliquid_pipeline.backtest import run_backtest, SMACrossover, data
+
+ohlcv = data.from_trades_parquet("data/processed/2024-01-02/BTC/trades.parquet", freq="5min")
+result = run_backtest(ohlcv, SMACrossover(fast=10, slow=30), fee_bps=10, slippage_bps=2)
+print(result.report())
+```
+
+What it does and doesn't do:
+
+- **No lookahead.** A signal computed from bar *i*'s close is executed starting bar *i+1* (positions are the signals shifted one bar). A strategy can't trade on the bar it just saw close.
+- **Costs are modelled.** Fees + slippage (in bps per side) are charged on traded notional every time the position changes — a long→short flip pays both sides.
+- **Long, short, flat** via a target position in `[-1, 1]`; returns compound into the equity curve.
+- Reports total return, CAGR, Sharpe, Sortino, max drawdown, win rate, profit factor, expectancy, trade count, and exposure.
+- Strategies included: `BuyAndHold` (baseline), `SMACrossover`, `RSIStrategy`. Write your own by subclassing `Strategy` and returning a target-position series.
+
+It is intentionally a clear, honest backtester (vectorized close-to-close with explicit cost and lag), not an exchange simulator — there's no partial-fill, queue-position, or funding-cost modelling. Treat results as a directional read, not a promise.
 
 ## Tests
 
