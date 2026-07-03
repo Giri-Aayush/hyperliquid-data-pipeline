@@ -15,6 +15,9 @@ asyncpg>=0.29.0           # PostgreSQL async driver (used by create_async_engine
 influxdb-client>=1.40.0
 redis>=5.0.0
 
+# Order book reconstruction (sorted price levels for the L4/L2 book)
+sortedcontainers>=2.4.0
+
 # Scheduling
 APScheduler>=3.10.0
 

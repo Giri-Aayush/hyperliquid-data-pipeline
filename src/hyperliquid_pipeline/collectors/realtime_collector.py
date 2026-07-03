@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import json
+import random
 import websockets
 from pathlib import Path
 from datetime import datetime, timezone
@@ -52,14 +53,16 @@ class WebSocketConfig:
 class HyperliquidWebSocketCollector:
     """Real-time data collector using Hyperliquid WebSocket API."""
     
-    def __init__(self, symbols: List[str] = None):
+    def __init__(self, symbols: List[str] = None, ws_url: str = None):
         """Initialize the WebSocket collector.
-        
+
         Args:
             symbols: List of symbols to collect data for
+            ws_url: WebSocket endpoint override; defaults to the configured one
+                (the public gateway, or a colocated node's websocket)
         """
         self.symbols = symbols or settings.symbols_list
-        self.ws_url = "wss://api.hyperliquid.xyz/ws"
+        self.ws_url = ws_url or settings.hyperliquid_ws_url
         self.logger = logger.bind(component="realtime_collector")
         
         # Data buffers
@@ -577,23 +580,47 @@ class HyperliquidWebSocketCollector:
             # Remember when data stopped, so the next connect can size the gap.
             self._record_disconnect()
     
+    def _next_reconnect_delay(self, consecutive_failures: int) -> float:
+        """Full-jitter exponential backoff delay for the next reconnect attempt.
+
+        uniform(0, min(cap, base * 2^(n-1))) — the first retry is bounded by the
+        base delay, each further consecutive failure doubles the bound up to the
+        cap. Jitter avoids synchronized reconnect stampedes after an outage.
+        """
+        base = float(settings.websocket_reconnect_delay)
+        cap = float(settings.websocket_reconnect_max_delay)
+        exponent = max(0, consecutive_failures - 1)
+        bound = min(cap, base * (2 ** exponent))
+        return random.uniform(0, bound)
+
     async def start_with_reconnect(self):
         """Start WebSocket collector with automatic reconnection.
 
         The consumer task runs for the whole session (across reconnects) and is
-        cancelled when this coroutine is stopped or cancelled.
+        cancelled when this coroutine is stopped or cancelled. Reconnects use
+        full-jitter exponential backoff; the failure streak resets only once a
+        connection actually delivers a message, so a connect-accept-then-drop
+        loop cannot hammer the endpoint at the base rate.
         """
         consumer = asyncio.create_task(self._consume())
+        consecutive_failures = 0
         try:
             while True:
+                messages_before = self.message_count
                 try:
                     await self.connect()
                 except Exception as e:
                     self.logger.error(f"Connection failed: {e}")
 
+                if self.message_count > messages_before:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+
                 if not self.is_connected:
-                    self.logger.info(f"Reconnecting in {settings.websocket_reconnect_delay} seconds...")
-                    await asyncio.sleep(settings.websocket_reconnect_delay)
+                    delay = self._next_reconnect_delay(consecutive_failures)
+                    self.logger.info(f"Reconnecting in {delay:.1f} seconds...")
+                    await asyncio.sleep(delay)
         finally:
             consumer.cancel()
             try:

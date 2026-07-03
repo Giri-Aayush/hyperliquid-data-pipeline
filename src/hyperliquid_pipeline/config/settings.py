@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     
     # Hyperliquid API Configuration
     hyperliquid_api_url: str = Field(default="https://api.hyperliquid.xyz")
+    # WebSocket endpoint. Default is the public gateway; point it at a
+    # colocated node's websocket (or the order_book_server) to cut the
+    # CloudFront + shared-API-server hops.
+    hyperliquid_ws_url: str = Field(default="wss://api.hyperliquid.xyz/ws")
     hyperliquid_wallet_address: Optional[str] = None
     hyperliquid_private_key: Optional[str] = None
     
@@ -57,7 +61,13 @@ class Settings(BaseSettings):
     # Gate for the scheduled/initial historical S3 pulls (the CLI --historical
     # flag sets this). Gap backfill is unaffected — it serves the live archive.
     historical_enabled: bool = Field(default=True)
+    # Subscribe to the bbo channel (event-level top-of-book, pushed only when
+    # the best bid/ask changes on a block). Cheapest, freshest price signal.
+    subscribe_bbo: bool = Field(default=True)
+    # Reconnect backoff: full jitter, uniform(0, min(max_delay, delay·2^n)).
+    # websocket_reconnect_delay is the base (first-retry bound), max is the cap.
     websocket_reconnect_delay: int = Field(default=5)
+    websocket_reconnect_max_delay: float = Field(default=60.0)
     # Minimum reconnect gap (seconds) worth backfilling from the archive. Tiny
     # gaps aren't worth a requester-pays pull and the archive won't have them yet.
     websocket_gap_threshold_seconds: float = Field(default=5.0)
@@ -79,6 +89,27 @@ class Settings(BaseSettings):
     # Cap on the batching buffer. If the DB can't keep up, the oldest buffered
     # points are dropped (and counted) past this, bounding memory.
     storage_max_buffer: int = Field(default=50000)
+
+    # Lossless capture spool: every raw websocket frame is written to an
+    # hourly JSONL file, stamped with local receive time, BEFORE parsing and
+    # independent of the drop-oldest processing queue — so bursts can't punch
+    # holes in the research archive. Off by default (research pipeline
+    # behavior unchanged); turn on for capture hosts.
+    spool_enabled: bool = Field(default=False)
+    spool_dir: Path = Field(default=Path("./data/spool"))
+    # Hand-off queue to the spool writer. Sized so market bursts can't fill it
+    # (~minutes of full-rate flow); if it ever overflows the writer is starved
+    # (disk failure) and drops are counted as an alarm condition.
+    spool_queue_maxsize: int = Field(default=500_000)
+    spool_flush_interval: float = Field(default=1.0)
+
+    # Node-data feed: replay/tail raw book diffs from a non-validating node
+    # (--write-raw-book-diffs) through the L4 book. Off until a node exists.
+    node_feed_enabled: bool = Field(default=False)
+    node_data_dir: str = Field(default="")
+
+    # NTP server used by the latency bench to estimate local clock offset.
+    bench_ntp_server: str = Field(default="pool.ntp.org")
     
     # Logging
     log_level: str = Field(default="INFO")
