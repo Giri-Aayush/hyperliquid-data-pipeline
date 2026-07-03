@@ -191,22 +191,38 @@ class HistoricalDataCollector:
             self.logger.error(f"Failed to decompress {compressed_path}: {e}")
             return False
     
+    @staticmethod
+    def _unwrap_archive_record(record: dict) -> dict:
+        """Unwrap one archive line to the inner WS-style data dict.
+
+        The real archive format (verified against live bucket data, Apr 2026
+        and Sep 2023 alike) wraps the original websocket frame:
+            {"time": "<ISO ns capture time>", "ver_num": 1,
+             "raw": {"channel": "l2Book", "data": {coin, time(ms), levels}}}
+        Bare {coin, time, levels} records (the shape older docs implied) are
+        passed through unchanged so both parse.
+        """
+        raw = record.get('raw')
+        if isinstance(raw, dict) and 'data' in raw:
+            return raw['data']  # dict for l2Book frames, list for trades frames
+        return record
+
     def process_l2_book_data(self, file_path: Path) -> pd.DataFrame:
         """Process L2 orderbook data file.
-        
+
         Args:
             file_path: Path to the data file
-            
+
         Returns:
             Processed DataFrame
         """
         try:
             data_records = []
-            
+
             with open(file_path, 'r') as f:
                 for line in f:
                     if line.strip():
-                        record = json.loads(line.strip())
+                        record = self._unwrap_archive_record(json.loads(line.strip()))
                         data_records.append({
                             'timestamp': record.get('time', 0),
                             'symbol': record.get('coin', ''),
@@ -236,18 +252,26 @@ class HistoricalDataCollector:
         """
         try:
             data_records = []
-            
+
+            def _append(trade: dict):
+                data_records.append({
+                    'timestamp': trade.get('time', 0),
+                    'symbol': trade.get('coin', ''),
+                    'price': float(trade.get('px', 0)),
+                    'size': float(trade.get('sz', 0)),
+                    'side': trade.get('side', ''),
+                    'trade_id': trade.get('tid', ''),
+                })
+
             with open(file_path, 'r') as f:
                 for line in f:
                     if line.strip():
-                        record = json.loads(line.strip())
-                        data_records.append({
-                            'timestamp': record.get('time', 0),
-                            'symbol': record.get('coin', ''),
-                            'price': float(record.get('px', 0)),
-                            'size': float(record.get('sz', 0)),
-                            'side': record.get('side', ''),
-                        })
+                        record = self._unwrap_archive_record(json.loads(line.strip()))
+                        if isinstance(record, list):  # wrapped WS trades frame
+                            for trade in record:
+                                _append(trade)
+                        else:
+                            _append(record)
             
             df = pd.DataFrame(data_records)
             if not df.empty:
@@ -283,7 +307,18 @@ class HistoricalDataCollector:
         """
         if data_types is None:
             data_types = ['l2Book', 'trades']
-        
+
+        if 'trades' in data_types:
+            # Verified against the live bucket (2023 and 2026 dates alike):
+            # market_data/{date}/{hour}/ contains ONLY l2Book/ — no trades/.
+            # Requesting trades quietly yields nothing, which also means the
+            # reconnect gap-backfill (which replays archive trades) cannot
+            # recover trades from this source. Loud so nobody assumes otherwise.
+            self.logger.warning(
+                "hyperliquid-archive publishes only l2Book — trades requests "
+                "will download nothing (gap backfill included)"
+            )
+
         results = {symbol: {dt: pd.DataFrame() for dt in data_types} for symbol in symbols}
         
         # Generate all download requests
