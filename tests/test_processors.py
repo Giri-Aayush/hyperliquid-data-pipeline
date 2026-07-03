@@ -122,6 +122,39 @@ class TestOrderBookMetrics:
         proc.update_orderbook(make_trade("BTC", 100.0, 1.0, datetime.now(timezone.utc)))
         assert "BTC" not in proc.latest_orderbooks
 
+    def test_imbalance_5_ignores_deep_book_spoof(self):
+        """A huge resting order 10 levels down skews the all-levels imbalance
+        but must not move the top-5 variant — that's the point of having it."""
+        proc = OrderBookProcessor()
+        bids = [(100 - i, 1) for i in range(9)] + [(90, 500)]  # spoof at level 10
+        asks = [(101 + i, 1) for i in range(10)]
+        proc.update_orderbook(make_orderbook("BTC", bids, asks))
+        m = proc.calculate_metrics("BTC")
+        assert m["imbalance"] > 0.9        # all-levels reading is dominated by the spoof
+        assert m["imbalance_5"] == pytest.approx(0.0)  # top-5 doesn't see it
+
+    def test_metrics_read_through_book_view(self):
+        """The processor's book is the shared BookView the rest of the system
+        types against — the L4 book plugs into the same consumers."""
+        from hyperliquid_pipeline.book import BookView
+
+        proc = OrderBookProcessor()
+        proc.update_orderbook(make_orderbook("BTC", [(100, 2)], [(101, 1)]))
+        book = proc.get_book("BTC")
+        assert isinstance(book, BookView)
+        assert book.best_bid() == ("100", 2.0)
+        assert book.is_crossed() is False
+        assert proc.calculate_metrics("BTC")["crossed"] is False
+        assert proc.get_book("ETH") is None
+
+    def test_snapshot_replaces_book(self):
+        proc = OrderBookProcessor()
+        proc.update_orderbook(make_orderbook("BTC", [(100, 2), (99, 1)], [(101, 1)]))
+        proc.update_orderbook(make_orderbook("BTC", [(98, 5)], [(99.5, 1)]))
+        m = proc.calculate_metrics("BTC")
+        assert m["best_bid"] == 98.0   # old levels gone: full replacement
+        assert m["bid_levels"] == 1
+
 
 class TestTechnicalIndicators:
     def test_sma(self):

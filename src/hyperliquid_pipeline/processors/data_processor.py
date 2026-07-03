@@ -11,6 +11,7 @@ from loguru import logger
 import json
 from pathlib import Path
 
+from ..book import L2Book
 from ..collectors.realtime_collector import MarketDataPoint
 from ..storage.database import DataStorage, MultiStorage, BatchingStorage, RedisStorage, InfluxDBStorage, PostgreSQLStorage
 from ..config import settings
@@ -138,71 +139,89 @@ class OHLCVProcessor:
 
 
 class OrderBookProcessor:
-    """Processes orderbook data to extract metrics."""
-    
+    """Computes book metrics through the shared book core (BookView).
+
+    Holds one L2Book per symbol, fully replaced per l2Book snapshot, and
+    reads metrics through the same frozen interface the order-level L4Book
+    implements — so when the node feed lands, downstream consumers can swap
+    book implementations without this layer changing.
+    """
+
+    # depth() argument that means "every level the snapshot carries".
+    _ALL_LEVELS = 1_000_000
+
     def __init__(self):
         """Initialize orderbook processor."""
+        self.books: Dict[str, "L2Book"] = {}
         self.latest_orderbooks: Dict[str, MarketDataPoint] = {}
         self.logger = logger.bind(component="orderbook_processor")
-    
+
     def update_orderbook(self, orderbook_data: MarketDataPoint):
-        """Update latest orderbook for a symbol.
-        
+        """Update the book for a symbol from an l2Book snapshot point.
+
         Args:
             orderbook_data: Orderbook data point
         """
         if orderbook_data.data_type != 'orderbook':
             return
-        
-        self.latest_orderbooks[orderbook_data.symbol] = orderbook_data
-    
+
+        symbol = orderbook_data.symbol
+        self.latest_orderbooks[symbol] = orderbook_data
+        book = self.books.get(symbol)
+        if book is None:
+            book = self.books[symbol] = L2Book(coin=symbol)
+        book.update_from_snapshot(
+            orderbook_data.data.get('bids', []),
+            orderbook_data.data.get('asks', []),
+            orderbook_data.data.get('timestamp_ms', 0),
+        )
+
+    def get_book(self, symbol: str) -> Optional["L2Book"]:
+        """The live book for a symbol (a BookView), or None if never updated."""
+        return self.books.get(symbol)
+
     def calculate_metrics(self, symbol: str) -> Optional[Dict[str, float]]:
         """Calculate orderbook metrics for a symbol.
-        
+
         Args:
             symbol: Trading symbol
-            
+
         Returns:
             Orderbook metrics dictionary or None
         """
-        if symbol not in self.latest_orderbooks:
+        book = self.books.get(symbol)
+        if book is None:
             return None
-        
-        orderbook = self.latest_orderbooks[symbol]
-        bids = orderbook.data.get('bids', [])
-        asks = orderbook.data.get('asks', [])
-        
-        if not bids or not asks:
+
+        best_bid_level = book.best_bid()
+        best_ask_level = book.best_ask()
+        if best_bid_level is None or best_ask_level is None:
             return None
-        
-        # Extract prices and sizes
-        bid_prices = [float(level.get('px', 0)) for level in bids]
-        bid_sizes = [float(level.get('sz', 0)) for level in bids]
-        ask_prices = [float(level.get('px', 0)) for level in asks]
-        ask_sizes = [float(level.get('sz', 0)) for level in asks]
-        
-        # Calculate metrics
-        best_bid = bid_prices[0] if bid_prices else 0
-        best_ask = ask_prices[0] if ask_prices else 0
-        mid_price = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else 0
-        spread = best_ask - best_bid if best_bid > 0 and best_ask > 0 else 0
+
+        best_bid = float(best_bid_level[0])
+        best_ask = float(best_ask_level[0])
+        mid_price = book.mid() or 0
+        spread = best_ask - best_bid
         spread_bps = (spread / mid_price) * 10000 if mid_price > 0 else 0
-        
-        # Depth calculations
+
+        full = book.depth(self._ALL_LEVELS)
+        top5 = book.depth(5)
+        bid_sizes = [level['sz'] for level in full['bids']]
+        ask_sizes = [level['sz'] for level in full['asks']]
+
         total_bid_volume = sum(bid_sizes)
         total_ask_volume = sum(ask_sizes)
-        
-        # Weighted average prices for depth
-        if len(bid_prices) >= 5:
-            bid_depth_5 = sum(bid_sizes[:5])
-            ask_depth_5 = sum(ask_sizes[:5])
-        else:
-            bid_depth_5 = total_bid_volume
-            ask_depth_5 = total_ask_volume
-        
-        # Imbalance
-        imbalance = (total_bid_volume - total_ask_volume) / (total_bid_volume + total_ask_volume) if (total_bid_volume + total_ask_volume) > 0 else 0
-        
+        bid_depth_5 = sum(level['sz'] for level in top5['bids'])
+        ask_depth_5 = sum(level['sz'] for level in top5['asks'])
+
+        # Imbalance over ALL levels (legacy field, kept for continuity) and
+        # over the top 5 — the deep book is the easiest place to spoof, so
+        # the top-5 variant is the one a signal should prefer.
+        total_volume = total_bid_volume + total_ask_volume
+        imbalance = (total_bid_volume - total_ask_volume) / total_volume if total_volume > 0 else 0
+        depth5_volume = bid_depth_5 + ask_depth_5
+        imbalance_5 = (bid_depth_5 - ask_depth_5) / depth5_volume if depth5_volume > 0 else 0
+
         metrics = {
             'best_bid': best_bid,
             'best_ask': best_ask,
@@ -214,10 +233,12 @@ class OrderBookProcessor:
             'bid_depth_5': bid_depth_5,
             'ask_depth_5': ask_depth_5,
             'imbalance': imbalance,
-            'bid_levels': len(bids),
-            'ask_levels': len(asks)
+            'imbalance_5': imbalance_5,
+            'crossed': book.is_crossed(),
+            'bid_levels': len(full['bids']),
+            'ask_levels': len(full['asks'])
         }
-        
+
         return metrics
 
 
