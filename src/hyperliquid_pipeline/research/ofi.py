@@ -20,9 +20,11 @@ Three input formats, auto-detected per line, all on the exchange clock:
 * DataLogger 'bbo' records (event-level, preferred): ``data.bid/ask`` with
   ``data.timestamp_ms``;
 * DataLogger 'orderbook' records (live L2 snapshots, top level used);
-* hyperliquid-archive raw l2Book hours (``market_data/<date>/<hour>/l2Book/
-  <coin>.lz4``): one ``{"time": ms, "coin", "levels": [bids, asks]}`` per
-  line — the same shape historical_collector parses. Plain or ``.lz4``.
+* hyperliquid-archive l2Book hours (``market_data/<date>/<hour>/l2Book/
+  <coin>.lz4``): one wrapper per line — ``{"time": <ISO ns capture>,
+  "ver_num", "raw": {"channel": "l2Book", "data": {coin, time (exchange
+  ms), levels: [bids, asks]}}}`` (format verified on real Apr-2026 hours;
+  a bare ``{time, coin, levels}`` payload is accepted too). Plain or .lz4.
 
 CLI (mix capture files and archive hours freely):
     python -m hyperliquid_pipeline.research.ofi <capture.jsonl|hour.lz4 ...> \
@@ -79,6 +81,15 @@ def _open_text(path: Path) -> TextIO:
 def _top_of_book(record: Dict[str, Any]) -> Optional[Tuple[str, int, dict, dict]]:
     """Extract (symbol, t_ms, bid_level, ask_level) from any supported line
     shape, or None when the line carries no two-sided top of book."""
+    raw = record.get("raw")
+    if isinstance(raw, dict):
+        # Real hyperliquid-archive lines wrap the verbatim WS frame:
+        # {"time": <ISO ns capture>, "ver_num": 1, "raw": {"channel":
+        # "l2Book", "data": {coin, time (exchange ms), levels}}}.
+        # Unwrap to the frame payload; the exchange clock lives inside it.
+        if raw.get("channel") != "l2Book":
+            return None
+        record = raw.get("data") or {}
     data_type = record.get("data_type")
     if data_type is not None:  # DataLogger capture record
         sym = record.get("symbol")

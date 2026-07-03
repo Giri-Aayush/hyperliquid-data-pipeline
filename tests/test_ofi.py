@@ -207,6 +207,30 @@ def test_loader_reads_archive_l2_lines(tmp_path):
     assert load_bbo_events(str(path), symbol="SOL").keys() == {"SOL"}
 
 
+def test_loader_reads_real_archive_wrapper_lines(tmp_path):
+    """The REAL archive format (verified on Apr-2026 hours): an ISO-ns
+    capture timestamp + ver_num wrapping the verbatim WS frame under 'raw'.
+    The exchange clock is raw.data.time, NOT the capture timestamp."""
+    verbatim = (
+        '{"time":"2026-04-01T10:00:00.050123456","ver_num":1,"raw":{"channel":"l2Book",'
+        '"data":{"coin":"BTC","time":1775037600050,"levels":'
+        '[[{"px":"68614.0","sz":"0.30995","n":4}],[{"px":"68615.0","sz":"13.21825","n":30}]]}}}'
+    )
+    other_channel = (
+        '{"time":"2026-04-01T10:00:00.060","ver_num":1,'
+        '"raw":{"channel":"trades","data":{"coin":"BTC"}}}'
+    )
+    path = tmp_path / "wrapped.jsonl"
+    path.write_text(verbatim + "\n" + other_channel + "\n")
+
+    series = load_bbo_events(str(path))
+    assert set(series) == {"BTC"}  # non-l2Book channels are skipped
+    event = series["BTC"][0]
+    assert event.t_ms == 1775037600050  # exchange ms, not the ISO capture time
+    assert (event.bid_px, event.bid_sz) == (68614.0, 0.30995)
+    assert (event.ask_px, event.ask_sz) == (68615.0, 13.21825)
+
+
 def test_loader_reads_lz4_archive_hours(tmp_path):
     import lz4.frame
 
