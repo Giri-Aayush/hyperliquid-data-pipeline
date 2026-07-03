@@ -265,7 +265,21 @@ class InfluxDBStorage(DataStorage):
             
         elif data_point.data_type == 'ticker':
             point.field("mid_price", data_point.data.get('mid_price', 0.0))
-        
+
+        elif data_point.data_type == 'bbo':
+            # Event-level top-of-book; either side may be absent.
+            bid = data_point.data.get('bid')
+            ask = data_point.data.get('ask')
+            if bid:
+                point.field("best_bid_price", float(bid['px']))
+                point.field("best_bid_size", float(bid['sz']))
+            if ask:
+                point.field("best_ask_price", float(ask['px']))
+                point.field("best_ask_size", float(ask['sz']))
+            if not bid and not ask:
+                # A field-less point is rejected by InfluxDB; mark the empty book.
+                point.field("empty_book", 1)
+
         return point
     
     async def store_data_point(self, data_point: MarketDataPoint) -> bool:

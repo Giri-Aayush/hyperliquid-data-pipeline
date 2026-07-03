@@ -83,6 +83,9 @@ class HyperliquidWebSocketCollector:
         self.funding_buffer: Dict[str, deque] = {symbol: deque(maxlen=100) for symbol in self.symbols}
         # Per-asset context: mark/oracle/mid price, open interest, funding, premium.
         self.asset_ctx_buffer: Dict[str, deque] = {symbol: deque(maxlen=1000) for symbol in self.symbols}
+        # Event-level top-of-book (bbo channel): one entry per BBO change.
+        # Deeper ring than the snapshot buffers — this is the highest-value feed.
+        self.bbo_buffer: Dict[str, deque] = {symbol: deque(maxlen=10000) for symbol in self.symbols}
         
         # Connection state
         self.is_connected = False
@@ -140,7 +143,19 @@ class HyperliquidWebSocketCollector:
             List of subscription dictionaries
         """
         subscriptions = []
-        
+
+        # Subscribe to event-level top-of-book first (highest-priority data:
+        # pushed per block, only when the best bid/ask actually changes).
+        if settings.subscribe_bbo:
+            for symbol in self.symbols:
+                subscriptions.append({
+                    "method": "subscribe",
+                    "subscription": {
+                        "type": "bbo",
+                        "coin": symbol
+                    }
+                })
+
         # Subscribe to L2 orderbook for each symbol
         for symbol in self.symbols:
             subscriptions.append({
@@ -428,6 +443,49 @@ class HyperliquidWebSocketCollector:
             self.logger.error(f"Error processing asset ctx message: {e}")
             return None
 
+    def process_bbo_message(self, message: Dict[str, Any]) -> Optional[MarketDataPoint]:
+        """Process a bbo message: event-level top-of-book, pushed per block
+        only when the best bid/ask changes.
+
+        data schema: {coin, time (ms), bbo: [bid|null, ask|null]}, each level
+        {px, sz, n}. Either side can be null (empty side of book). Raw level
+        dicts are kept (string prices), matching the l2Book style.
+
+        Args:
+            message: WebSocket message
+
+        Returns:
+            MarketDataPoint or None
+        """
+        try:
+            data = message.get('data', {})
+            coin = data.get('coin')
+            if not coin or coin not in self.symbols:
+                return None
+
+            bbo = data.get('bbo') or [None, None]
+            time_ms = data.get('time', int(time.time() * 1000))
+
+            bbo_data = {
+                'bid': bbo[0] if len(bbo) > 0 else None,
+                'ask': bbo[1] if len(bbo) > 1 else None,
+                'timestamp_ms': time_ms,
+            }
+
+            data_point = MarketDataPoint(
+                timestamp=datetime.fromtimestamp(time_ms / 1000, tz=timezone.utc),
+                symbol=coin,
+                data_type='bbo',
+                data=bbo_data,
+            )
+
+            self.bbo_buffer.setdefault(coin, deque(maxlen=10000)).append(data_point)
+            return data_point
+
+        except Exception as e:
+            self.logger.error(f"Error processing bbo message: {e}")
+            return None
+
     def _record_disconnect(self):
         """Remember the last message time at disconnect, to measure the next gap."""
         self._last_disconnect_seen = self.last_message_time
@@ -481,7 +539,12 @@ class HyperliquidWebSocketCollector:
             data_points = []
             
             # Route message based on channel
-            if channel == 'l2Book':
+            if channel == 'bbo':
+                data_point = self.process_bbo_message(message)
+                if data_point:
+                    data_points.append(data_point)
+
+            elif channel == 'l2Book':
                 data_point = self.process_l2_book_message(message)
                 if data_point:
                     data_points.append(data_point)
@@ -690,6 +753,8 @@ class HyperliquidWebSocketCollector:
             buffer = self.ticker_buffer.get(symbol, deque())
         elif data_type == 'asset_ctx':
             buffer = self.asset_ctx_buffer.get(symbol, deque())
+        elif data_type == 'bbo':
+            buffer = self.bbo_buffer.get(symbol, deque())
         else:
             return []
         
@@ -725,7 +790,8 @@ class HyperliquidWebSocketCollector:
                 'orderbook': len(self.orderbook_buffer.get(symbol, [])),
                 'trades': len(self.trades_buffer.get(symbol, [])),
                 'ticker': len(self.ticker_buffer.get(symbol, [])),
-                'asset_ctx': len(self.asset_ctx_buffer.get(symbol, []))
+                'asset_ctx': len(self.asset_ctx_buffer.get(symbol, [])),
+                'bbo': len(self.bbo_buffer.get(symbol, []))
             }
         
         return {
