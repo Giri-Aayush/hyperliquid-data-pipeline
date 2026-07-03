@@ -72,6 +72,29 @@ def test_historical_disabled_skips_daily_job():
         settings.historical_enabled = original
 
 
+def test_node_feed_task_stopped_on_shutdown():
+    """stop() must end the node-feed tail the same way it ends the realtime
+    task — cooperatively first, then cancel — or shutdown hangs on it."""
+    from hyperliquid_pipeline.collectors.node_feed import NodeDiffFeed
+
+    async def run():
+        orch = _make_orchestrator()
+        orch.node_feed = NodeDiffFeed(data_dir=None)
+        orch._node_feed_task = asyncio.create_task(asyncio.sleep(999))
+        task = orch._node_feed_task
+        await asyncio.wait_for(orch.stop(), timeout=1.0)
+        assert task.cancelled()
+        assert orch._node_feed_task is None
+
+    asyncio.run(run())
+
+
+def test_node_feed_disabled_by_default():
+    orch = _make_orchestrator()
+    assert settings.node_feed_enabled is False
+    assert orch.node_feed is None
+
+
 def test_historical_enabled_registers_daily_job():
     original = settings.historical_enabled
     try:

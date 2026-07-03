@@ -15,6 +15,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from ..config import settings
 from ..collectors.historical_collector import HistoricalDataCollector
+from ..collectors.node_feed import NodeDiffFeed
 from ..collectors.realtime_collector import HyperliquidWebSocketCollector, DataLogger, GapEvent
 from ..collectors.backfill import backfill_gap
 from ..processors.data_processor import DataProcessor, create_storage_backends
@@ -32,6 +33,7 @@ class DataPipelineOrchestrator:
         # Components
         self.historical_collector: Optional[HistoricalDataCollector] = None
         self.realtime_collector: Optional[HyperliquidWebSocketCollector] = None
+        self.node_feed: Optional[NodeDiffFeed] = None
         self.data_processor: Optional[DataProcessor] = None
         self.storage: Optional[DataStorage] = None
         self.scheduler: Optional[AsyncIOScheduler] = None
@@ -49,6 +51,7 @@ class DataPipelineOrchestrator:
         # process hangs after "graceful shutdown" begins. The shutdown task is
         # kept referenced so the event loop can't garbage-collect it mid-run.
         self._realtime_task: Optional[asyncio.Task] = None
+        self._node_feed_task: Optional[asyncio.Task] = None
         self._shutdown_task: Optional[asyncio.Task] = None
         self.stats = {
             'messages_processed': 0,
@@ -119,6 +122,16 @@ class DataPipelineOrchestrator:
             # On a reconnect gap, queue it (fast, synchronous — never blocks the
             # socket). The periodic retry job does the actual archive backfill.
             self.realtime_collector.add_gap_callback(self._queue_gap)
+
+            # Node diff feed: order-level books from a local node's raw book
+            # diffs. Same downstream wiring as the websocket collector —
+            # validation/processing plus raw JSONL — so 'book_diff' points
+            # flow through the exact pipeline everything else does.
+            if settings.node_feed_enabled:
+                self.node_feed = NodeDiffFeed()
+                self.node_feed.add_data_callback(validated_data_callback)
+                self.node_feed.add_data_callback(self.data_logger.log_data_point)
+                self.logger.info("Node diff feed initialized")
 
             # Initialize scheduler
             self.scheduler = AsyncIOScheduler()
@@ -427,6 +440,16 @@ class DataPipelineOrchestrator:
             if self.realtime_collector:
                 collector_stats = self.realtime_collector.get_stats()
             
+            # Node feed counters, when enabled
+            node_str = ""
+            if self.node_feed is not None:
+                node_stats = self.node_feed.get_stats()
+                node_str = (
+                    f", Node feed: blocks={node_stats['blocks']} "
+                    f"diffs={node_stats['diffs']} skips={node_stats['parse_skips']} "
+                    f"stale={node_stats['stale_coins'] or 'none'}"
+                )
+
             # Feed latency summary (exchange event time -> local receive time)
             latency = collector_stats.get('latency_ms') or {}
             latency_str = ", ".join(
@@ -444,6 +467,7 @@ class DataPipelineOrchestrator:
                 f"Connected: {collector_stats.get('is_connected', False)}, "
                 f"Last Data: {self.stats['last_data_time']}"
                 + (f", Feed latency: {latency_str}" if latency_str else "")
+                + node_str
             )
             
         except Exception as e:
@@ -469,6 +493,11 @@ class DataPipelineOrchestrator:
             if self.realtime_collector and settings.real_time_enabled:
                 self.logger.info("Starting real-time data collection...")
                 self._realtime_task = asyncio.create_task(self.realtime_collector.start_with_reconnect())
+
+            # Start the node diff feed tail (survives the node not being up yet)
+            if self.node_feed is not None:
+                self.logger.info("Starting node diff feed tail...")
+                self._node_feed_task = asyncio.create_task(self.node_feed.tail())
             
             # Initial historical data collection (last 7 days if no data exists)
             if settings.historical_enabled:
@@ -553,6 +582,17 @@ class DataPipelineOrchestrator:
                 except asyncio.CancelledError:
                     pass
                 self._realtime_task = None
+
+            # Stop the node feed the cooperative way first, then cancel.
+            if self._node_feed_task is not None:
+                if self.node_feed is not None:
+                    self.node_feed.stop()
+                self._node_feed_task.cancel()
+                try:
+                    await self._node_feed_task
+                except asyncio.CancelledError:
+                    pass
+                self._node_feed_task = None
 
             # Stop scheduler
             if self.scheduler and self.scheduler.running:
