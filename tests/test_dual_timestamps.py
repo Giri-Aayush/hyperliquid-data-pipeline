@@ -100,8 +100,15 @@ def test_sanitizer_preserves_recv_fields():
     assert sanitized_book.recv_ts_ms == RECV_MS
 
 
+class _NullStore:
+    """Truthy no-op object store, so tests never resolve the configured one."""
+
+    def put_file(self, *args, **kwargs):
+        pass
+
+
 def test_jsonl_line_contains_recv_fields(tmp_path):
-    logger_ = DataLogger(output_dir=str(tmp_path), object_store=None)
+    logger_ = DataLogger(output_dir=str(tmp_path), object_store=_NullStore())
     point = MarketDataPoint(
         timestamp=datetime.fromtimestamp(EXCHANGE_MS / 1000, tz=timezone.utc),
         symbol="BTC",

@@ -15,6 +15,7 @@ from collections import deque
 
 from ..config import settings
 from ..utils.latency import LatencyHistogram
+from .spool import RawSpool
 
 if TYPE_CHECKING:  # annotation only; runtime import is deferred to avoid a cycle
     from ..storage.object_store import ObjectStore
@@ -101,6 +102,11 @@ class HyperliquidWebSocketCollector:
         # oldest points are dropped so the freshest data always gets through.
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=settings.websocket_queue_maxsize)
         self.dropped_count = 0
+
+        # Lossless capture spool: raw frames are written to hourly JSONL files
+        # independent of (and before) the drop-oldest queue above, so load
+        # shedding on the processing path can't punch holes in the archive.
+        self.spool: Optional[RawSpool] = RawSpool() if settings.spool_enabled else None
 
         # Gap detection: callbacks fired with a GapEvent when a reconnect leaves
         # a window of missed data. _last_disconnect_seen is the last message time
@@ -519,6 +525,18 @@ class HyperliquidWebSocketCollector:
                 self.logger.error(f"Error in gap callback: {e}")
         return event
 
+    async def _on_raw_frame(
+        self,
+        message_str: str,
+        recv_ts_ms: float,
+        recv_mono_ns: int,
+    ):
+        """Handle one raw frame from the socket: spool first (lossless, before
+        any parsing can fail or shed load), then parse and route."""
+        if self.spool is not None:
+            self.spool.enqueue(message_str, recv_ts_ms, recv_mono_ns)
+        await self.process_message(message_str, recv_ts_ms=recv_ts_ms, recv_mono_ns=recv_mono_ns)
+
     async def process_message(
         self,
         message_str: str,
@@ -670,11 +688,7 @@ class HyperliquidWebSocketCollector:
                 # Listen for messages. Stamp receive time BEFORE parsing so the
                 # stamp reflects the wire, not json.loads.
                 async for message in websocket:
-                    recv_ts_ms = time.time() * 1000
-                    recv_mono_ns = time.monotonic_ns()
-                    await self.process_message(
-                        message, recv_ts_ms=recv_ts_ms, recv_mono_ns=recv_mono_ns
-                    )
+                    await self._on_raw_frame(message, time.time() * 1000, time.monotonic_ns())
 
         except websockets.exceptions.ConnectionClosed:
             self.logger.warning("WebSocket connection closed")
@@ -709,6 +723,8 @@ class HyperliquidWebSocketCollector:
         loop cannot hammer the endpoint at the base rate.
         """
         consumer = asyncio.create_task(self._consume())
+        if self.spool is not None:
+            self.spool.start()
         consecutive_failures = 0
         try:
             while True:
@@ -733,7 +749,12 @@ class HyperliquidWebSocketCollector:
                 await consumer
             except asyncio.CancelledError:
                 pass
-    
+            if self.spool is not None:
+                try:
+                    await self.spool.close()  # drain fully, finalize + upload
+                except Exception as e:
+                    self.logger.error(f"Error closing spool: {e}")
+
     def get_recent_data(self, symbol: str, data_type: str, limit: int = 100) -> List[MarketDataPoint]:
         """Get recent data from buffers.
         
@@ -808,6 +829,7 @@ class HyperliquidWebSocketCollector:
                 channel: histogram.snapshot()
                 for channel, histogram in self._latency.items()
             },
+            'spool': self.spool.stats() if self.spool is not None else None,
         }
 
 
