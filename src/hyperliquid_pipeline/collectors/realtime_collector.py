@@ -14,6 +14,7 @@ import time
 from collections import deque
 
 from ..config import settings
+from ..utils.latency import LatencyHistogram
 
 if TYPE_CHECKING:  # annotation only; runtime import is deferred to avoid a cycle
     from ..storage.object_store import ObjectStore
@@ -21,11 +22,21 @@ if TYPE_CHECKING:  # annotation only; runtime import is deferred to avoid a cycl
 
 @dataclass
 class MarketDataPoint:
-    """Single market data point."""
+    """Single market data point.
+
+    timestamp is exchange time where the feed provides one (l2Book, trades,
+    bbo), local time otherwise. The recv_* fields are stamped at the socket
+    read, before parsing: wall-clock ms for measuring feed latency against the
+    exchange timestamp, and a monotonic ns stamp for jitter analysis immune to
+    clock steps. None for points not built from a live socket frame (backfill,
+    tests, historical replay).
+    """
     timestamp: datetime
     symbol: str
-    data_type: str  # 'orderbook', 'trade', 'ticker', 'funding'
+    data_type: str  # 'orderbook', 'trade', 'ticker', 'funding', 'bbo', ...
     data: Dict[str, Any]
+    recv_ts_ms: Optional[float] = None
+    recv_mono_ns: Optional[int] = None
 
 
 @dataclass
@@ -99,6 +110,13 @@ class HyperliquidWebSocketCollector:
         self.message_count = 0
         self.last_message_time = None
         self.connection_start_time = None
+
+        # Feed latency (exchange event time -> local receive time), per channel.
+        # Only channels that carry an exchange timestamp are measured; allMids
+        # and activeAssetCtx don't, so they're skipped by design.
+        self._latency: Dict[str, LatencyHistogram] = {
+            channel: LatencyHistogram() for channel in ('l2Book', 'trades', 'bbo')
+        }
         
     def add_data_callback(self, callback: Callable[[MarketDataPoint], None]):
         """Add a callback function to process incoming data.
@@ -443,16 +461,23 @@ class HyperliquidWebSocketCollector:
                 self.logger.error(f"Error in gap callback: {e}")
         return event
 
-    async def process_message(self, message_str: str):
+    async def process_message(
+        self,
+        message_str: str,
+        recv_ts_ms: Optional[float] = None,
+        recv_mono_ns: Optional[int] = None,
+    ):
         """Process incoming WebSocket message.
-        
+
         Args:
             message_str: Raw message string
+            recv_ts_ms: wall-clock ms stamped at the socket read, before parsing
+            recv_mono_ns: monotonic ns stamped at the same instant
         """
         try:
             message = json.loads(message_str)
             channel = message.get('channel', '')
-            
+
             data_points = []
             
             # Route message based on channel
@@ -477,6 +502,19 @@ class HyperliquidWebSocketCollector:
                 if data_point:
                     data_points.append(data_point)
             
+            # Stamp local receive time on every point (the buffers hold the same
+            # objects, so buffered copies carry the stamps too), and record feed
+            # latency for channels that carry an exchange timestamp.
+            if recv_ts_ms is not None:
+                histogram = self._latency.get(channel)
+                for data_point in data_points:
+                    data_point.recv_ts_ms = recv_ts_ms
+                    data_point.recv_mono_ns = recv_mono_ns
+                    if histogram is not None:
+                        exchange_ms = data_point.data.get('timestamp_ms')
+                        if exchange_ms:
+                            histogram.record(recv_ts_ms - exchange_ms)
+
             # Hand off to the processing queue. The consumer task runs the
             # callbacks, so a slow callback can never stall the socket read loop.
             for data_point in data_points:
@@ -566,9 +604,14 @@ class HyperliquidWebSocketCollector:
 
                 self.logger.info(f"Sent {len(subscriptions)} subscriptions")
 
-                # Listen for messages
+                # Listen for messages. Stamp receive time BEFORE parsing so the
+                # stamp reflects the wire, not json.loads.
                 async for message in websocket:
-                    await self.process_message(message)
+                    recv_ts_ms = time.time() * 1000
+                    recv_mono_ns = time.monotonic_ns()
+                    await self.process_message(
+                        message, recv_ts_ms=recv_ts_ms, recv_mono_ns=recv_mono_ns
+                    )
 
         except websockets.exceptions.ConnectionClosed:
             self.logger.warning("WebSocket connection closed")
@@ -694,7 +737,11 @@ class HyperliquidWebSocketCollector:
             'queue_maxsize': self._queue.maxsize,
             'dropped_count': self.dropped_count,
             'buffer_sizes': buffer_sizes,
-            'symbols': self.symbols
+            'symbols': self.symbols,
+            'latency_ms': {
+                channel: histogram.snapshot()
+                for channel, histogram in self._latency.items()
+            },
         }
 
 

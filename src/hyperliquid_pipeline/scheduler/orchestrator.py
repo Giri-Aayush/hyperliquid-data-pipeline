@@ -427,6 +427,14 @@ class DataPipelineOrchestrator:
             if self.realtime_collector:
                 collector_stats = self.realtime_collector.get_stats()
             
+            # Feed latency summary (exchange event time -> local receive time)
+            latency = collector_stats.get('latency_ms') or {}
+            latency_str = ", ".join(
+                f"{channel} p50={snap['p50_ms']:.0f}ms p99={snap['p99_ms']:.0f}ms n={snap['count']}"
+                for channel, snap in latency.items()
+                if snap.get('count')
+            )
+
             # Log comprehensive stats
             self.logger.info(
                 f"Pipeline Stats - "
@@ -435,6 +443,7 @@ class DataPipelineOrchestrator:
                 f"Errors: {self.stats['errors_encountered']}, "
                 f"Connected: {collector_stats.get('is_connected', False)}, "
                 f"Last Data: {self.stats['last_data_time']}"
+                + (f", Feed latency: {latency_str}" if latency_str else "")
             )
             
         except Exception as e:

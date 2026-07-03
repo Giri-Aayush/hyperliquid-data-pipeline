@@ -112,6 +112,24 @@ class PostgreSQLStorage(DataStorage):
             self.logger.error(f"Failed to initialize PostgreSQL storage: {e}")
             raise
     
+    @staticmethod
+    def _jsonb_payload(data_point: MarketDataPoint) -> Dict[str, Any]:
+        """JSONB payload for a point: the data dict, plus local capture stamps.
+
+        The table schema predates the recv_* fields and create_all can't ALTER,
+        so the stamps ride inside the JSONB under "_capture" — lossless, no
+        migration, and absent entirely for points that never had them.
+        """
+        if data_point.recv_ts_ms is None:
+            return data_point.data
+        return {
+            **data_point.data,
+            "_capture": {
+                "recv_ts_ms": data_point.recv_ts_ms,
+                "recv_mono_ns": data_point.recv_mono_ns,
+            },
+        }
+
     async def store_data_point(self, data_point: MarketDataPoint) -> bool:
         """Store a single data point."""
         try:
@@ -120,16 +138,16 @@ class PostgreSQLStorage(DataStorage):
                     timestamp=data_point.timestamp,
                     symbol=data_point.symbol,
                     data_type=data_point.data_type,
-                    data=data_point.data
+                    data=self._jsonb_payload(data_point)
                 )
                 session.add(db_record)
                 await session.commit()
                 return True
-                
+
         except Exception as e:
             self.logger.error(f"Failed to store data point: {e}")
             return False
-    
+
     async def store_data_points(self, data_points: List[MarketDataPoint]) -> int:
         """Store multiple data points."""
         try:
@@ -139,14 +157,14 @@ class PostgreSQLStorage(DataStorage):
                         timestamp=dp.timestamp,
                         symbol=dp.symbol,
                         data_type=dp.data_type,
-                        data=dp.data
+                        data=self._jsonb_payload(dp)
                     )
                     for dp in data_points
                 ]
                 session.add_all(db_records)
                 await session.commit()
                 return len(db_records)
-                
+
         except Exception as e:
             self.logger.error(f"Failed to store data points: {e}")
             return 0

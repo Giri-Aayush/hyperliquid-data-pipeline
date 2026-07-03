@@ -3,7 +3,7 @@
 import asyncio
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timedelta, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import pandas as pd
 import numpy as np
@@ -482,13 +482,10 @@ class DataSanitizer:
                 'timestamp_ms': data_point.data.get('timestamp_ms', int(data_point.timestamp.timestamp() * 1000))
             }
             
-            return MarketDataPoint(
-                timestamp=data_point.timestamp,
-                symbol=data_point.symbol,
-                data_type=data_point.data_type,
-                data=sanitized_data
-            )
-            
+            # replace() (not a field-by-field rebuild) so fields beyond data —
+            # e.g. the recv_ts_ms/recv_mono_ns capture stamps — survive.
+            return replace(data_point, data=sanitized_data)
+
         except Exception as e:
             self.logger.error(f"Error sanitizing trade data: {e}")
             return None
@@ -556,13 +553,8 @@ class DataSanitizer:
                 'timestamp_ms': data_point.data.get('timestamp_ms', int(data_point.timestamp.timestamp() * 1000))
             }
             
-            return MarketDataPoint(
-                timestamp=data_point.timestamp,
-                symbol=data_point.symbol,
-                data_type=data_point.data_type,
-                data=sanitized_data
-            )
-            
+            return replace(data_point, data=sanitized_data)
+
         except Exception as e:
             self.logger.error(f"Error sanitizing orderbook data: {e}")
             return None
