@@ -181,6 +181,43 @@ def test_loader_parses_bbo_and_orderbook_and_skips_junk(tmp_path):
     assert set(only_btc) == {"BTC"}
 
 
+def _archive_line(coin, t_ms, bids, asks):
+    """One hyperliquid-archive raw l2Book line (historical_collector shape)."""
+    return json.dumps({"time": t_ms, "coin": coin, "levels": [bids, asks]})
+
+
+ARCHIVE_LINES = [
+    _archive_line(
+        "BTC", 2000, [_level(100.1, 2), _level(100.0, 9)], [_level(100.2, 1)]
+    ),
+    _archive_line("BTC", 1000, [_level(100.0, 1)], [_level(100.1, 1)]),
+    _archive_line("BTC", 3000, [], [_level(100.2, 1)]),  # empty bid side: skip
+    _archive_line("SOL", 1500, [_level(150.0, 3)], [_level(150.1, 4)]),
+]
+
+
+def test_loader_reads_archive_l2_lines(tmp_path):
+    path = tmp_path / "9"  # archive hour files are named by hour, no suffix
+    path.write_text("\n".join(ARCHIVE_LINES) + "\n")
+    series = load_bbo_events(str(path))
+    assert set(series) == {"BTC", "SOL"}
+    assert [e.t_ms for e in series["BTC"]] == [1000, 2000]
+    top = series["BTC"][1]
+    assert (top.bid_px, top.bid_sz, top.ask_px) == (100.1, 2.0, 100.2)  # top level
+    assert load_bbo_events(str(path), symbol="SOL").keys() == {"SOL"}
+
+
+def test_loader_reads_lz4_archive_hours(tmp_path):
+    import lz4.frame
+
+    plain = tmp_path / "9"
+    plain.write_text("\n".join(ARCHIVE_LINES) + "\n")
+    compressed = tmp_path / "BTC.lz4"
+    with lz4.frame.open(compressed, mode="wt") as fh:
+        fh.write(plain.read_text())
+    assert load_bbo_events(str(compressed)) == load_bbo_events(str(plain))
+
+
 # --- CLI ----------------------------------------------------------------------
 
 

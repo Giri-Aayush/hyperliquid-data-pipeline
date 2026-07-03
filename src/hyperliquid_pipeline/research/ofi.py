@@ -15,13 +15,17 @@ changes on each window's OFI, per (window, horizon). The output is a
 directional research read over one captured session — short-sample, non-iid,
 no costs/latency modeled — NOT a strategy and NOT a backtest.
 
-Input is the DataLogger's per-stream JSONL (see the caveats on the report):
-'bbo' records (event-level, preferred) or 'orderbook' records (L2 snapshots,
-top level used) so archived L2 data works too. The clock is the exchange's
-``data.timestamp_ms`` throughout.
+Three input formats, auto-detected per line, all on the exchange clock:
 
-CLI:
-    python -m hyperliquid_pipeline.research.ofi <capture.jsonl ...> \
+* DataLogger 'bbo' records (event-level, preferred): ``data.bid/ask`` with
+  ``data.timestamp_ms``;
+* DataLogger 'orderbook' records (live L2 snapshots, top level used);
+* hyperliquid-archive raw l2Book hours (``market_data/<date>/<hour>/l2Book/
+  <coin>.lz4``): one ``{"time": ms, "coin", "levels": [bids, asks]}`` per
+  line — the same shape historical_collector parses. Plain or ``.lz4``.
+
+CLI (mix capture files and archive hours freely):
+    python -m hyperliquid_pipeline.research.ofi <capture.jsonl|hour.lz4 ...> \
         [--windows 1,5] [--horizons 1,5,30] [--symbol BTC] [--output report.json]
 """
 
@@ -29,7 +33,10 @@ import argparse
 import bisect
 import json
 import math
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, TextIO, Tuple
+
+import lz4.frame
 
 
 class BboEvent(NamedTuple):
@@ -62,19 +69,59 @@ CAVEATS: Tuple[str, ...] = (
 # --- loading ----------------------------------------------------------------
 
 
+def _open_text(path: Path) -> TextIO:
+    """Open plain or .lz4 files as text (archive hours ship lz4-compressed)."""
+    if path.suffix == ".lz4":
+        return lz4.frame.open(path, mode="rt")  # type: ignore[return-value]
+    return open(path, mode="rt")
+
+
+def _top_of_book(record: Dict[str, Any]) -> Optional[Tuple[str, int, dict, dict]]:
+    """Extract (symbol, t_ms, bid_level, ask_level) from any supported line
+    shape, or None when the line carries no two-sided top of book."""
+    data_type = record.get("data_type")
+    if data_type is not None:  # DataLogger capture record
+        sym = record.get("symbol")
+        data = record.get("data") or {}
+        t_ms = data.get("timestamp_ms")
+        if data_type == "bbo":
+            bid, ask = data.get("bid"), data.get("ask")
+        elif data_type == "orderbook":
+            bids, asks = data.get("bids") or [], data.get("asks") or []
+            bid = bids[0] if bids else None
+            ask = asks[0] if asks else None
+        else:
+            return None
+    elif "levels" in record:  # hyperliquid-archive raw l2Book line
+        sym = record.get("coin")
+        t_ms = record.get("time")
+        levels = record.get("levels") or []
+        bids = levels[0] if len(levels) > 0 else []
+        asks = levels[1] if len(levels) > 1 else []
+        bid = bids[0] if bids else None
+        ask = asks[0] if asks else None
+    else:
+        return None
+    if sym is None or t_ms is None or bid is None or ask is None:
+        return None
+    return sym, t_ms, bid, ask
+
+
 def load_bbo_events(
     path: str, symbol: Optional[str] = None
 ) -> Dict[str, List[BboEvent]]:
-    """Parse one DataLogger JSONL file into per-symbol, time-ordered series.
+    """Parse one capture/archive file into per-symbol, time-ordered series.
 
-    Accepts 'bbo' records ({data: {bid, ask, timestamp_ms}}) and 'orderbook'
-    records ({data: {bids, asks, timestamp_ms}}, top level used). One-sided
-    events (null bid/ask, empty book side) carry no two-sided top and are
-    skipped, as are malformed lines — the loader is capture-tolerant by
-    design; correctness of the math is pinned by tests, not by the reader.
+    Accepts DataLogger 'bbo' records ({data: {bid, ask, timestamp_ms}}),
+    DataLogger 'orderbook' records (top level used), and hyperliquid-archive
+    raw l2Book lines ({time, coin, levels: [bids, asks]}), plain or .lz4 —
+    auto-detected per line. One-sided events (null bid/ask, empty book side)
+    carry no two-sided top and are skipped, as are malformed lines — the
+    loader is capture-tolerant by design; correctness of the math is pinned
+    by tests, not by the reader.
     """
     series: Dict[str, List[BboEvent]] = {}
-    with open(path) as fh:
+    with _open_text(Path(path)) as fh:
         for line in fh:
             line = line.strip()
             if not line:
@@ -85,21 +132,11 @@ def load_bbo_events(
                 continue
             if not isinstance(record, dict):
                 continue
-            sym = record.get("symbol")
-            if sym is None or (symbol is not None and sym != symbol):
+            top = _top_of_book(record)
+            if top is None:
                 continue
-            data = record.get("data") or {}
-            data_type = record.get("data_type")
-            if data_type == "bbo":
-                bid, ask = data.get("bid"), data.get("ask")
-            elif data_type == "orderbook":
-                bids, asks = data.get("bids") or [], data.get("asks") or []
-                bid = bids[0] if bids else None
-                ask = asks[0] if asks else None
-            else:
-                continue
-            t_ms = data.get("timestamp_ms")
-            if bid is None or ask is None or t_ms is None:
+            sym, t_ms, bid, ask = top
+            if symbol is not None and sym != symbol:
                 continue
             try:
                 event = BboEvent(
@@ -282,11 +319,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m hyperliquid_pipeline.research.ofi",
         description=(
-            "Order-flow imbalance read over captured bbo/orderbook JSONL: "
-            "does top-of-book flow lead the mid? Prints per-symbol tables."
+            "Order-flow imbalance read over live capture JSONL and/or "
+            "hyperliquid-archive l2Book hours: does top-of-book flow lead "
+            "the mid? Prints per-symbol tables."
         ),
     )
-    parser.add_argument("files", nargs="+", help="DataLogger JSONL capture files")
+    parser.add_argument(
+        "files",
+        nargs="+",
+        help="DataLogger capture JSONL and/or archive l2Book hours (.lz4 ok)",
+    )
     parser.add_argument(
         "--windows", default="1,5", help="window lengths in seconds (comma-separated)"
     )
