@@ -54,6 +54,9 @@ class Settings(BaseSettings):
     collect_symbols: str = Field(default="BTC,ETH,SOL,ARB,AVAX,MATIC,OP,LTC,LINK,UNI")
     historical_start_date: str = Field(default="2023-01-01")
     real_time_enabled: bool = Field(default=True)
+    # Gate for the scheduled/initial historical S3 pulls (the CLI --historical
+    # flag sets this). Gap backfill is unaffected — it serves the live archive.
+    historical_enabled: bool = Field(default=True)
     websocket_reconnect_delay: int = Field(default=5)
     # Minimum reconnect gap (seconds) worth backfilling from the archive. Tiny
     # gaps aren't worth a requester-pays pull and the archive won't have them yet.

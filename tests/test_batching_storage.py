@@ -186,6 +186,49 @@ def test_failed_flush_requeues_batch_for_retry():
     asyncio.run(run())
 
 
+class _DeadStorage(DataStorage):
+    """Never raises but stores nothing — how MultiStorage reports a total outage.
+
+    MultiStorage gathers with return_exceptions=True and each backend swallows
+    its own errors, so a full outage surfaces as store_data_points() == 0, not
+    as an exception. The batcher must treat that as a failed flush too.
+    """
+
+    def __init__(self, dead_flushes):
+        self.dead_flushes = dead_flushes
+        self.batches = []
+
+    async def store_data_point(self, dp):
+        return False
+
+    async def store_data_points(self, dps):
+        if self.dead_flushes > 0:
+            self.dead_flushes -= 1
+            return 0
+        self.batches.append(list(dps))
+        return len(dps)
+
+    async def get_data(self, *a):
+        return []
+
+    async def close(self):
+        pass
+
+
+def test_zero_stored_flush_requeues_batch_for_retry():
+    async def run():
+        dead = _DeadStorage(dead_flushes=1)
+        bs = BatchingStorage(dead, batch_size=1000, flush_interval=999)
+        for i in range(3):
+            await bs.store_data_point(_pt(i))
+        await bs.flush()  # inner returned 0 without raising -> re-queued, not dropped
+        assert dead.batches == []
+        await bs.flush()  # backends recovered -> original batch lands intact, in order
+        assert [p.data["tid"] for p in dead.batches[0]] == [0, 1, 2]
+
+    asyncio.run(run())
+
+
 def test_buffer_cap_drops_oldest():
     async def run():
         fake = _FakeStorage()

@@ -35,7 +35,9 @@ class MarketDataTable(Base):
     symbol = sa.Column(sa.String(20), nullable=False, index=True)
     data_type = sa.Column(sa.String(20), nullable=False, index=True)
     data = sa.Column(JSONB, nullable=False)
-    created_at = sa.Column(sa.DateTime(timezone=True), default=datetime.now(timezone.utc))
+    # Callable default: evaluated per row. A bare datetime.now(...) here would be
+    # evaluated once at import and stamp every row with process start time.
+    created_at = sa.Column(sa.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     
     __table_args__ = (
         sa.Index('idx_symbol_type_timestamp', 'symbol', 'data_type', 'timestamp'),
@@ -252,7 +254,12 @@ class InfluxDBStorage(DataStorage):
         """Store a single data point."""
         try:
             point = self._data_point_to_influx_point(data_point)
-            self.write_api.write(bucket=settings.influxdb_bucket, record=point)
+            # The influxdb client write is a blocking HTTP round-trip; run it in
+            # an executor so it can't stall the event loop (same as RedisStorage).
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.write_api.write(bucket=settings.influxdb_bucket, record=point)
+            )
             return True
             
         except Exception as e:
@@ -263,7 +270,10 @@ class InfluxDBStorage(DataStorage):
         """Store multiple data points."""
         try:
             points = [self._data_point_to_influx_point(dp) for dp in data_points]
-            self.write_api.write(bucket=settings.influxdb_bucket, record=points)
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.write_api.write(bucket=settings.influxdb_bucket, record=points)
+            )
             return len(points)
             
         except Exception as e:
@@ -624,12 +634,23 @@ class BatchingStorage(DataStorage):
             batch = list(self._buffer)
             self._buffer.clear()
         try:
-            await self.inner.store_data_points(batch)
+            stored = await self.inner.store_data_points(batch)
         except Exception as e:
             async with self._lock:
                 self._buffer.extendleft(reversed(batch))  # restore original order at front
                 self._enforce_cap_locked()
             self.logger.error(f"Batch flush failed, re-queued {len(batch)} points for retry: {e}")
+            return
+        # MultiStorage swallows backend exceptions and reports a count instead of
+        # raising, so a total backend outage surfaces here as stored == 0. Treat
+        # that as a failed flush too, or the batch would be silently discarded.
+        if batch and stored == 0:
+            async with self._lock:
+                self._buffer.extendleft(reversed(batch))
+                self._enforce_cap_locked()
+            self.logger.error(
+                f"Batch flush stored 0 of {len(batch)} points (all backends failing?); re-queued for retry"
+            )
 
     async def get_data(
         self,

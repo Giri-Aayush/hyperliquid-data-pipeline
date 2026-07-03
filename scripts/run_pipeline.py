@@ -16,6 +16,15 @@ from hyperliquid_pipeline.config import settings
 app = typer.Typer(help="Hyperliquid Data Collection Pipeline")
 
 
+def _normalize_symbols(symbols: str) -> str:
+    """Normalize a user-supplied symbol list to the comma-string settings expect.
+
+    settings.collect_symbols is a str (settings.symbols_list splits it), so the
+    CLI override must stay a string — assigning a list here crashes symbols_list.
+    """
+    return ",".join(s.strip() for s in symbols.split(",") if s.strip())
+
+
 @app.command()
 def start(
     symbols: str = typer.Option(
@@ -63,12 +72,13 @@ def start(
     
     # Override symbols if provided
     if symbols:
-        settings.collect_symbols = [s.strip() for s in symbols.split(",")]
-    
+        settings.collect_symbols = _normalize_symbols(symbols)
+
     # Override settings
     settings.real_time_enabled = realtime
-    
-    logger.info(f"Starting pipeline with symbols: {settings.collect_symbols}")
+    settings.historical_enabled = historical
+
+    logger.info(f"Starting pipeline with symbols: {settings.symbols_list}")
     logger.info(f"Real-time enabled: {realtime}")
     logger.info(f"Historical enabled: {historical}")
     

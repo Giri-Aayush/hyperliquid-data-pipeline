@@ -45,6 +45,11 @@ class DataPipelineOrchestrator:
         # State tracking
         self.is_running = False
         self.start_time: Optional[datetime] = None
+        # The live-collection task start() awaits; stop() must cancel it or the
+        # process hangs after "graceful shutdown" begins. The shutdown task is
+        # kept referenced so the event loop can't garbage-collect it mid-run.
+        self._realtime_task: Optional[asyncio.Task] = None
+        self._shutdown_task: Optional[asyncio.Task] = None
         self.stats = {
             'messages_processed': 0,
             'errors_encountered': 0,
@@ -59,7 +64,7 @@ class DataPipelineOrchestrator:
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals."""
         self.logger.info(f"Received signal {signum}, shutting down gracefully...")
-        asyncio.create_task(self.stop())
+        self._shutdown_task = asyncio.create_task(self.stop())
     
     async def initialize(self):
         """Initialize all components."""
@@ -131,13 +136,14 @@ class DataPipelineOrchestrator:
             return
         
         # Daily historical data collection (at 1 AM UTC)
-        self.scheduler.add_job(
-            self._collect_historical_data,
-            trigger=CronTrigger(hour=1, minute=0),
-            id='daily_historical_collection',
-            name='Daily Historical Data Collection',
-            max_instances=1
-        )
+        if settings.historical_enabled:
+            self.scheduler.add_job(
+                self._collect_historical_data,
+                trigger=CronTrigger(hour=1, minute=0),
+                id='daily_historical_collection',
+                name='Daily Historical Data Collection',
+                max_instances=1
+            )
         
         # Data quality report generation (every 6 hours)
         self.scheduler.add_job(
@@ -453,19 +459,18 @@ class DataPipelineOrchestrator:
             # Start real-time data collection
             if self.realtime_collector and settings.real_time_enabled:
                 self.logger.info("Starting real-time data collection...")
-                realtime_task = asyncio.create_task(self.realtime_collector.start_with_reconnect())
-            else:
-                realtime_task = None
+                self._realtime_task = asyncio.create_task(self.realtime_collector.start_with_reconnect())
             
             # Initial historical data collection (last 7 days if no data exists)
-            await self._initial_data_collection()
+            if settings.historical_enabled:
+                await self._initial_data_collection()
             
             self.logger.info("Data pipeline started successfully")
             
             # Keep the pipeline running
-            if realtime_task:
+            if self._realtime_task is not None:
                 try:
-                    await realtime_task
+                    await self._realtime_task
                 except asyncio.CancelledError:
                     self.logger.info("Real-time collection cancelled")
             else:
@@ -524,16 +529,27 @@ class DataPipelineOrchestrator:
             self.logger.error(f"Error in initial data collection: {e}")
     
     async def stop(self):
-        """Stop the data pipeline."""
+        """Stop the data pipeline. Idempotent; safe to call before start()."""
         try:
             self.logger.info("Stopping data pipeline...")
             self.is_running = False
-            
+
+            # Cancel live collection FIRST — start() awaits this task, so without
+            # cancelling it the process hangs after shutdown begins. Cancelling
+            # it also stops new data flowing before the sinks below are closed.
+            if self._realtime_task is not None:
+                self._realtime_task.cancel()
+                try:
+                    await self._realtime_task
+                except asyncio.CancelledError:
+                    pass
+                self._realtime_task = None
+
             # Stop scheduler
             if self.scheduler and self.scheduler.running:
                 self.scheduler.shutdown(wait=True)
                 self.logger.info("Scheduler stopped")
-            
+
             # Close data logger
             if self.data_logger:
                 self.data_logger.close_all_files()
