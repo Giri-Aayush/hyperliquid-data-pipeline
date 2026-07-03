@@ -231,6 +231,8 @@ def generate_config():
 
 # Hyperliquid API Configuration
 HYPERLIQUID_API_URL=https://api.hyperliquid.xyz
+# Point at a colocated node's websocket later; default is the public gateway.
+HYPERLIQUID_WS_URL=wss://api.hyperliquid.xyz/ws
 HYPERLIQUID_WALLET_ADDRESS=your_wallet_address_here
 HYPERLIQUID_PRIVATE_KEY=your_private_key_here
 
@@ -262,7 +264,40 @@ REDIS_DB=0
 COLLECT_SYMBOLS=BTC,ETH,SOL,ARB,AVAX,MATIC,OP,LTC,LINK,UNI
 HISTORICAL_START_DATE=2023-01-01
 REAL_TIME_ENABLED=true
+HISTORICAL_ENABLED=true
+SUBSCRIBE_BBO=true
 WEBSOCKET_RECONNECT_DELAY=5
+WEBSOCKET_RECONNECT_MAX_DELAY=60
+WEBSOCKET_GAP_THRESHOLD_SECONDS=5.0
+WEBSOCKET_QUEUE_MAXSIZE=10000
+
+# Storage batching (flush at whichever comes first)
+STORAGE_BATCH_SIZE=500
+STORAGE_FLUSH_INTERVAL=1.0
+STORAGE_MAX_BUFFER=50000
+
+# Lossless capture spool (turn on for capture hosts)
+SPOOL_ENABLED=false
+SPOOL_DIR=./data/spool
+SPOOL_QUEUE_MAXSIZE=500000
+SPOOL_FLUSH_INTERVAL=1.0
+
+# Node data feed (needs a non-validating node writing raw book diffs)
+NODE_FEED_ENABLED=false
+NODE_DATA_DIR=
+
+# Latency bench clock-offset probe
+BENCH_NTP_SERVER=pool.ntp.org
+
+# S3 archive source (requester-pays) and your own object-store cache
+HYPERLIQUID_ARCHIVE_BUCKET=hyperliquid-archive
+NODE_DATA_BUCKET=hl-mainnet-node-data
+OBJECT_STORE_BACKEND=auto
+OBJECT_STORE_ENDPOINT_URL=
+OBJECT_STORE_BUCKET=
+OBJECT_STORE_ACCESS_KEY_ID=
+OBJECT_STORE_SECRET_ACCESS_KEY=
+OBJECT_STORE_REGION=auto
 
 # Monitoring & Alerts
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token

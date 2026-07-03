@@ -4,14 +4,19 @@
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-Collects market data from Hyperliquid — both live over WebSocket and historical from the S3 archive — turns it into OHLCV candles, indicators, and orderbook metrics, writes it to whichever store you point it at, and **backtests strategies against it**. I built it to feed my own trading research.
+The foundation of a **high-frequency trading system on Hyperliquid**, grown out of a market-data pipeline. It captures event-level market data losslessly with dual timestamps (exchange time + local receive time), reconstructs order books — down to per-order FIFO queue position from node data — measures feed latency, turns the stream into candles, indicators, and book metrics, stores it wherever you point it, and **backtests strategies against the result**.
 
 ```
- WebSocket (live) ─┐
-                   ├─▶  collect ──▶ process ──▶ validate ──▶  store ──▶  backtest
- S3 archive (past) ─┘                  │                  (Postgres · InfluxDB    (strategy →
-                                       │                   · Redis · Parquet/R2)   Sharpe, PnL, DD)
-                                       └── OHLCV · RSI/EMA/Bollinger · spread, depth, imbalance
+ feeds                          book (market state)          capture & storage
+ ─────                          ───────────────────          ─────────────────
+ public WS: bbo · l2Book ──┬──▶ L2Book (snapshots)  ──┬──▶  raw-frame spool (lossless WAL)
+   trades · asset ctx      │    L4Book (per-order,    │     Postgres · InfluxDB · Redis
+ node raw book diffs ──────┘      queue position)     │     JSONL · Parquet/R2
+ S3 archive (history) ─────┐    one BookView protocol │
+                           │                          ▼
+                           └──▶ process ─▶ validate ─▶ store ─▶ backtest (Sharpe, PnL, DD)
+                                    │
+ measurement: per-channel feed-latency histograms · rerunnable ws-latency bench (SNTP-corrected)
 ```
 
 ## Try it in 30 seconds
@@ -101,14 +106,26 @@ The chart and a summary JSON come from [`examples/analyze_btc_capture.py`](examp
 
 | Module | Does |
 |---|---|
-| `collectors/realtime_collector.py` | WebSocket feeds — l2Book, trades, mids, user events — with reconnect and bounded buffers |
+| `collectors/realtime_collector.py` | WebSocket feeds — **bbo (event-level top-of-book)**, l2Book, trades, mids, asset ctx, user events — every frame stamped with local receive time; full-jitter reconnect backoff; per-channel feed-latency histograms in `get_stats()` |
+| `collectors/spool.py` | Lossless capture: every raw frame to hourly JSONL **before** parsing, independent of the drop-oldest processing queue — bursts can't punch holes in the archive |
 | `collectors/historical_collector.py` | Pulls L2 snapshots and trades from the `hyperliquid-archive` S3 bucket (LZ4, requester-pays) |
-| `processors/data_processor.py` | Trades → OHLCV with VWAP; SMA/EMA/RSI/Bollinger; orderbook spread (bps), depth, imbalance |
+| `book/` | The market-state core: `L4Book` (order-by-order reconstruction from node raw book diffs, FIFO queue-position queries), `L2Book` (snapshot book), one frozen `BookView` read protocol behind both, a strict-mode diff parser, and a deterministic replay engine + CLI |
+| `bench/` | Feed-latency benchmark: exact per-channel percentiles with an SNTP clock-offset correction; the identical command re-runs from a colocated host |
+| `processors/data_processor.py` | Trades → OHLCV with VWAP; SMA/EMA/RSI/Bollinger; book metrics read through `BookView` — spread (bps), depth, imbalance (all-levels and spoof-resistant top-5) |
 | `utils/validation.py` | Crossed books, bad sort order, price jumps, volume spikes, stale and duplicate points |
-| `storage/database.py` | One interface, three DB backends: PostgreSQL (asyncpg), InfluxDB, Redis. Use any subset (each optional) |
-| `storage/object_store.py` | S3-compatible object store (Cloudflare R2 / AWS S3 / Backblaze / MinIO): caches raw pulls, stores Parquet output |
+| `storage/database.py` | One interface, three DB backends: PostgreSQL (asyncpg, lossless JSONB + capture stamps), InfluxDB, Redis. Use any subset (each optional) |
+| `storage/object_store.py` | S3-compatible object store (Cloudflare R2 / AWS S3 / Backblaze / MinIO): caches raw pulls, stores Parquet output, mirrors spool + JSONL files |
 | `scheduler/orchestrator.py` | APScheduler jobs for daily history pulls and quality reports; clean shutdown on signals |
 | `backtest/` | Run a strategy over the collected OHLCV: no-lookahead engine, fees + slippage, long/short, and a metrics report (Sharpe, Sortino, drawdown, win rate, profit factor, expectancy) |
+
+### The HFT capture path
+
+Priorities follow where the edge actually lives on this venue: **freshness of top-of-book beats depth**, order-level data beats aggregates, and none of it is worth much if you can't measure your own latency.
+
+- **bbo first.** The `bbo` channel pushes only when the best bid/ask changes on a block — the highest-signal, lowest-cost feed. Subscribed by default (`SUBSCRIBE_BBO=false` to opt out).
+- **Dual timestamps everywhere.** Every point carries the exchange event time *and* `recv_ts_ms`/`recv_mono_ns` stamped at the socket read, before parsing. Feed latency is measured per channel into log-bucketed histograms (`get_stats()["latency_ms"]`) and benchmarked exactly with `scripts/bench_ws_latency.py` — run it now for a baseline, re-run it unchanged from a Tokyo host after colocating.
+- **Lossless spool.** Set `SPOOL_ENABLED=true` on a capture host and every raw frame lands in `data/spool/` hourly files regardless of what the processing path drops under load.
+- **Node-ready.** `HYPERLIQUID_WS_URL` points the same collector at a colocated node; the `book/` diff parser reads `--write-raw-book-diffs` output (run your first real node hour with `strict=True` — any format drift raises with the offending keys named). `python -m hyperliquid_pipeline.book.replay <snapshot> <diffs…>` rebuilds a book deterministically from recorded data.
 
 ## Running the full thing
 
@@ -155,15 +172,18 @@ With that set, `collect-historical` caches raw LZ4 under `raw/…` (read-through
 
 ```
 src/hyperliquid_pipeline/
-├── collectors/    realtime (WebSocket) + historical (S3)
-├── processors/    OHLCV, indicators, orderbook metrics
+├── collectors/    realtime (WebSocket) + lossless spool + historical (S3)
+├── book/          L4/L2 order-book reconstruction, diff parser, replay (BookView)
+├── bench/         ws feed-latency benchmark (exact percentiles, SNTP-corrected)
+├── processors/    OHLCV, indicators, book metrics via BookView
 ├── storage/       PostgreSQL, InfluxDB, Redis + S3/R2 object store
 ├── scheduler/     APScheduler orchestration
-├── utils/         validation, quality reports
+├── utils/         validation, quality reports, latency histograms
 ├── backtest/      engine, strategies, metrics, OHLCV loaders
 └── config/        pydantic-settings (.env)
-scripts/run_pipeline.py   CLI: start · collect-historical · test-realtime
-tests/                    unit tests, no network
+scripts/run_pipeline.py       CLI: start · collect-historical · test-realtime
+scripts/bench_ws_latency.py   feed-latency benchmark
+tests/                        unit tests, no network
 ```
 
 ## Backtesting
@@ -198,7 +218,8 @@ Cover the parts where the math has to be right: OHLCV and VWAP, orderbook spread
 
 ## Worth knowing
 
-- The l2Book feed sends full snapshots per update, not deltas — metrics are computed per snapshot.
+- The l2Book feed sends full snapshots per update, not deltas — metrics are computed per snapshot. For event-level top-of-book use the `bbo` feed; for true order-level deltas you need a node's raw book diffs (which `book/` already parses and replays).
+- Latency numbers include your local clock offset. The bench harness estimates it via SNTP and reports raw + adjusted; treat sub-10ms differences as noise unless the host runs disciplined NTP.
 - S3 history costs real money (requester-pays). Start with a few days, and point `OBJECT_STORE_*` at R2 to avoid paying AWS twice for the same object.
 - Processed Parquet is mirrored to the object store for durability and sharing; the pipeline itself reads back only the raw cache, not processed output.
 - Indicators run over in-memory history, so restarting the process resets their state.
