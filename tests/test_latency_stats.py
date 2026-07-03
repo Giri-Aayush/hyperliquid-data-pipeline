@@ -71,7 +71,9 @@ def test_collector_records_latency_for_timestamped_channels():
         })
         mids = json.dumps({"channel": "allMids", "data": {"mids": {"BTC": "1.0"}}})
 
-        for frame in (l2, trades, mids):
+        # trades goes twice: the first message per coin is the subscription
+        # snapshot and is deliberately not recorded (see its dedicated test).
+        for frame in (l2, trades, trades, mids):
             await collector.process_message(frame, recv_ts_ms=recv_ms, recv_mono_ns=1)
 
         stats = collector.get_stats()["latency_ms"]
@@ -81,6 +83,36 @@ def test_collector_records_latency_for_timestamped_channels():
         assert stats["l2Book"]["p50_ms"] == 200.0
         # allMids has no exchange timestamp: never measured
         assert "allMids" not in stats
+
+    asyncio.run(run())
+
+
+def test_first_trades_message_per_coin_not_recorded():
+    """The trades subscription replays recent (old) trades first — recording
+    them would report seconds of phantom latency. Only live trades count."""
+    exchange_ms = 1_700_000_000_000
+
+    def trades_frame(ts):
+        return json.dumps({
+            "channel": "trades",
+            "data": [{"coin": "BTC", "px": "1.0", "sz": "1.0", "side": "B",
+                      "time": ts, "tid": ts}],
+        })
+
+    async def run():
+        collector = HyperliquidWebSocketCollector(["BTC", "ETH"])
+        # first BTC trades message: the snapshot — skipped
+        await collector.process_message(trades_frame(exchange_ms - 60_000),
+                                        recv_ts_ms=float(exchange_ms), recv_mono_ns=1)
+        assert collector.get_stats()["latency_ms"]["trades"]["count"] == 0
+        # second BTC trades message: live — recorded
+        await collector.process_message(trades_frame(exchange_ms),
+                                        recv_ts_ms=float(exchange_ms + 100), recv_mono_ns=2)
+        stats = collector.get_stats()["latency_ms"]["trades"]
+        assert stats["count"] == 1
+        assert stats["max_ms"] <= 200  # the 60s-old snapshot never polluted stats
+        # the snapshot points themselves still flowed through (stamped, queued)
+        assert collector._queue.qsize() == 2
 
     asyncio.run(run())
 

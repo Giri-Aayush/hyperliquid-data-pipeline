@@ -160,6 +160,7 @@ class LatencyBench:
             self.logger.warning(f"NTP probe against {self.ntp_server} failed; raw numbers only")
 
         deltas: Dict[str, List[float]] = {channel: [] for channel in self.channels}
+        primed_trades: set = set()  # first trades msg per coin = old-trades snapshot
         started_utc = datetime.now(timezone.utc).isoformat()
 
         self.logger.info(f"Connecting to {self.ws_url} for {self.duration_s:.0f}s")
@@ -185,6 +186,17 @@ class LatencyBench:
                     continue
                 channel = message.get("channel", "")
                 if channel in deltas:
+                    if channel == "trades":
+                        # Skip the per-coin subscription snapshot: it carries
+                        # OLD trades whose timestamps would read as seconds of
+                        # phantom latency (same convention as the collector).
+                        coins = {
+                            t.get("coin") for t in message.get("data", [])
+                            if isinstance(t, dict)
+                        }
+                        if not coins <= primed_trades:
+                            primed_trades |= coins
+                            continue
                     for exchange_ms in self._extract_exchange_ms(channel, message):
                         deltas[channel].append(recv_ms - exchange_ms)
 

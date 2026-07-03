@@ -126,6 +126,10 @@ class HyperliquidWebSocketCollector:
         self._latency: Dict[str, LatencyHistogram] = {
             channel: LatencyHistogram() for channel in ('l2Book', 'trades', 'bbo')
         }
+        # The first trades message per coin on a connection is a snapshot of
+        # recent (old) trades; recording those would poison the latency stats
+        # with multi-second phantom deltas. Cleared on every (re)connect.
+        self._trades_latency_primed: set = set()
         
     def add_data_callback(self, callback: Callable[[MarketDataPoint], None]):
         """Add a callback function to process incoming data.
@@ -588,10 +592,18 @@ class HyperliquidWebSocketCollector:
             # latency for channels that carry an exchange timestamp.
             if recv_ts_ms is not None:
                 histogram = self._latency.get(channel)
+                skip_symbols = set()
+                if channel == 'trades':
+                    # Don't record the per-coin subscription snapshot (old trades).
+                    skip_symbols = {
+                        dp.symbol for dp in data_points
+                        if dp.symbol not in self._trades_latency_primed
+                    }
+                    self._trades_latency_primed.update(dp.symbol for dp in data_points)
                 for data_point in data_points:
                     data_point.recv_ts_ms = recv_ts_ms
                     data_point.recv_mono_ns = recv_mono_ns
-                    if histogram is not None:
+                    if histogram is not None and data_point.symbol not in skip_symbols:
                         exchange_ms = data_point.data.get('timestamp_ms')
                         if exchange_ms:
                             histogram.record(recv_ts_ms - exchange_ms)
@@ -673,6 +685,9 @@ class HyperliquidWebSocketCollector:
                 self.connection_start_time = datetime.now(tz=timezone.utc)
                 
                 self.logger.info("WebSocket connected successfully")
+
+                # New connection: trades snapshots will be re-sent per coin.
+                self._trades_latency_primed.clear()
 
                 # If a prior connection dropped, measure the gap and fire backfill.
                 await self._maybe_emit_gap(self.connection_start_time)
