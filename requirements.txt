@@ -18,6 +18,10 @@ redis>=5.0.0
 # Order book reconstruction (sorted price levels for the L4/L2 book)
 sortedcontainers>=2.4.0
 
+# QuickNode Hypercore gRPC feed (L4 order stream; protos/orderbook.proto)
+grpcio>=1.60.0
+grpcio-tools>=1.60.0
+
 # Scheduling
 APScheduler>=3.10.0
 

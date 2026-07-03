@@ -114,6 +114,12 @@ class Settings(BaseSettings):
 
     # NTP server used by the latency bench to estimate local clock offset.
     bench_ntp_server: str = Field(default="pool.ntp.org")
+
+    # QuickNode Hypercore gRPC (StreamL4Book etc., protos/orderbook.proto).
+    # host:port (usually :10000) + the endpoint's auth token. Note: Hypercore
+    # streams need a paid QuickNode plan; free trial is rejected server-side.
+    quicknode_grpc_endpoint: str = Field(default="")
+    quicknode_grpc_token: Optional[str] = None
     
     # Logging
     log_level: str = Field(default="INFO")
