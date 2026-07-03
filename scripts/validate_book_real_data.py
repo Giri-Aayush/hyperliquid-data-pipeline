@@ -107,12 +107,19 @@ def _validate_file(path: Path, coins: tuple) -> int:
 
 
 def _s3_download(date: str, hour: int, key: Optional[str], max_mb: float,
-                 assume_yes: bool, discover: bool) -> Optional[Path]:
+                 assume_yes: bool, discover: bool, region: str) -> Optional[Path]:
     """Find and download one raw-book-diff file from the node-data bucket."""
     import boto3
     from botocore.exceptions import ClientError, NoCredentialsError
 
-    s3 = boto3.client("s3", region_name=settings.aws_default_region)
+    # Credentials come from settings (.env) explicitly — boto3's default
+    # chain can't read .env. Same pattern as HistoricalDataCollector.
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=settings.aws_access_key_id,
+        aws_secret_access_key=settings.aws_secret_access_key,
+        region_name=region,
+    )
     bucket = settings.node_data_bucket
     pay = {"RequestPayer": "requester"}
 
@@ -175,6 +182,11 @@ def main(
     discover: bool = typer.Option(False, "--discover", help="List the bucket's top-level layout"),
     max_mb: float = typer.Option(64.0, "--max-mb", help="Download size guard (requester-pays)"),
     yes: bool = typer.Option(False, "--yes", help="Proceed past the size guard"),
+    region: str = typer.Option(
+        "ap-northeast-1", "--region",
+        help="Bucket region (hl-mainnet-node-data lives in Tokyo, per its "
+             "x-amz-bucket-region header)",
+    ),
 ):
     """Strict-validate the book core against one real node data file."""
     logger.remove()
@@ -188,7 +200,7 @@ def main(
         if not discover and not (date or key):
             typer.echo("--s3 needs --date YYYYMMDD (and optionally --hour/--key)")
             raise typer.Exit(2)
-        file = _s3_download(date, hour, key or None, max_mb, yes, discover)
+        file = _s3_download(date, hour, key or None, max_mb, yes, discover, region)
         if file is None:
             raise typer.Exit(1 if not discover else 0)
 
