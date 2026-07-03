@@ -1,0 +1,2 @@
+{"user": "0xdddddddddddddddddddddddddddddddddddddd01", "oid": 31, "coin": "BTC", "side": "Bid", "px": "115400.0", "raw_book_diff": {"new": {"sz": "1.0"}}}
+{"user": "0xdddddddddddddddddddddddddddddddddddddd02", "oid": 41, "coin": "BTC", "side": "A", "px": "115399.0", "raw_book_diff": {"new": {"sz": "1.0"}}}

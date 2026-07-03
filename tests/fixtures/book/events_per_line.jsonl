@@ -1,0 +1,6 @@
+{"user": "0xcccccccccccccccccccccccccccccccccccccc01", "oid": 11, "coin": "BTC", "side": "Bid", "px": "115323.2", "raw_book_diff": {"new": {"sz": "0.2086"}}}
+{"user":"0x768484f7e2ebb675c57838366c02ae99ba2a9b08","oid":35061046831,"coin":"CHILLGUY","side":"Bid","px":"1.36","raw_book_diff":{"new":{"sz":"186910.0"}}}
+{"user": "0xcccccccccccccccccccccccccccccccccccccc02", "oid": 21, "coin": "BTC", "side": "A", "px": "115330.0", "raw_book_diff": {"new": {"sz": "1.5"}}}
+{"user": "0xcccccccccccccccccccccccccccccccccccccc03", "oid": 12, "coin": "BTC", "side": "B", "px": "115323.2", "raw_book_diff": {"new": {"sz": "0.5"}}}
+{"user": "0xcccccccccccccccccccccccccccccccccccccc01", "oid": 11, "coin": "BTC", "side": "Bid", "px": "115323.2", "raw_book_diff": {"update": {"origSz": "0.2086", "newSz": "0.207"}}}
+{"user": "0xcccccccccccccccccccccccccccccccccccccc02", "oid": 21, "coin": "BTC", "side": "A", "px": "115330.0", "raw_book_diff": "remove"}

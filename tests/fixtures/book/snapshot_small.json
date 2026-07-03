@@ -1,0 +1,15 @@
+{
+  "coin": "BTC",
+  "time": 1764867590000,
+  "height": 100,
+  "bids": [
+    {"user": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01", "coin": "BTC", "side": "B", "limit_px": "115000.0", "sz": "0.5", "oid": 1001, "timestamp": 1764867580000, "trigger_condition": "N/A", "is_trigger": false, "trigger_px": null, "is_position_tpsl": false, "reduce_only": false, "order_type": "Limit", "tif": "Gtc"},
+    {"user": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02", "coin": "BTC", "side": "B", "limit_px": "115000.0", "sz": "0.3", "oid": 1002, "timestamp": 1764867581000, "trigger_condition": "N/A", "is_trigger": false, "trigger_px": null, "is_position_tpsl": false, "reduce_only": false, "order_type": "Limit", "tif": "Gtc"},
+    {"user": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa03", "coin": "BTC", "side": "B", "limit_px": "114999.5", "sz": "1.0", "oid": 1003, "timestamp": 1764867582000, "trigger_condition": "N/A", "is_trigger": false, "trigger_px": null, "is_position_tpsl": false, "reduce_only": false, "order_type": "Limit", "tif": "Gtc"}
+  ],
+  "asks": [
+    {"user": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01", "coin": "BTC", "side": "A", "limit_px": "115000.5", "sz": "0.4", "oid": 2001, "timestamp": 1764867580500, "trigger_condition": "N/A", "is_trigger": false, "trigger_px": null, "is_position_tpsl": false, "reduce_only": false, "order_type": "Limit", "tif": "Gtc"},
+    {"user": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02", "coin": "BTC", "side": "A", "limit_px": "115000.5", "sz": "0.2", "oid": 2002, "timestamp": 1764867581500, "trigger_condition": "N/A", "is_trigger": false, "trigger_px": null, "is_position_tpsl": false, "reduce_only": false, "order_type": "Limit", "tif": "Gtc"},
+    {"user": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb03", "coin": "BTC", "side": "A", "limit_px": "115001.0", "sz": "2.0", "oid": 2003, "timestamp": 1764867582500, "trigger_condition": "N/A", "is_trigger": false, "trigger_px": null, "is_position_tpsl": false, "reduce_only": false, "order_type": "Limit", "tif": "Gtc"}
+  ]
+}
