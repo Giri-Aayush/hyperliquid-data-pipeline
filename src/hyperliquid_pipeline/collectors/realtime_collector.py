@@ -940,7 +940,7 @@ class DataLogger:
 async def main():
     """Example usage of the real-time collector."""
     # Create collector for major symbols
-    symbols = ['BTC', 'ETH', 'SOL', 'ARB']
+    symbols = ['BTC', 'ETH', 'SOL']
     collector = HyperliquidWebSocketCollector(symbols)
     
     # Create data logger

@@ -55,7 +55,11 @@ class Settings(BaseSettings):
     prometheus_port: int = Field(default=8000)
     
     # Data Collection Settings
-    collect_symbols: str = Field(default="BTC,ETH,SOL,ARB,AVAX,MATIC,OP,LTC,LINK,UNI")
+    # The trading universe is BTC, ETH, SOL PERPETUALS (user decision,
+    # 2026-07-04) — capture depth on what we'll trade beats breadth we won't.
+    # Bare coin names on the Hyperliquid WS are the perps (spot uses
+    # @index/pair identifiers), and activeAssetCtx here is the perp schema.
+    collect_symbols: str = Field(default="BTC,ETH,SOL")
     historical_start_date: str = Field(default="2023-01-01")
     real_time_enabled: bool = Field(default=True)
     # Gate for the scheduled/initial historical S3 pulls (the CLI --historical
