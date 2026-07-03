@@ -198,3 +198,14 @@ def test_empty_book_reads():
 
 def test_satisfies_the_bookview_protocol():
     assert isinstance(L4Book("BTC"), BookView)
+
+
+def test_anomaly_list_is_capped_but_the_count_stays_exact():
+    """A persistently malformed feed must not grow memory without bound."""
+    book = L4Book("BTC")
+    for oid in range(1500):
+        book.apply(_diff("remove", oid))  # all unknown oids
+    assert book.anomaly_count == 1500
+    assert len(book.anomalies) == 1000  # newest kept, oldest trimmed
+    assert book.anomalies[0]["oid"] == 500
+    assert book.anomalies[-1]["oid"] == 1499

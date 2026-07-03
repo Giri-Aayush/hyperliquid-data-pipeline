@@ -92,6 +92,13 @@ def test_satisfies_the_bookview_protocol():
     assert isinstance(L2Book("BTC"), BookView)
 
 
+def test_anomaly_list_is_capped_but_the_count_stays_exact():
+    book = L2Book("BTC")
+    book.update_from_snapshot([{"sz": "no px"}] * 1500, [], time_ms=1)
+    assert book.anomaly_count == 1500
+    assert len(book.anomalies) == 1000
+
+
 def test_depth_shape_matches_l4_book_exactly():
     """An L2 feed and an L4 reconstruction of the same book must be
     indistinguishable through BookView."""

@@ -16,6 +16,9 @@ from typing import Any
 
 from hyperliquid_pipeline.book.schemas import BID
 
+# Same memory-bound policy as L4Book: keep the newest dicts, count them all.
+ANOMALY_KEEP = 1000
+
 
 class _Level:
     __slots__ = ("px", "price", "size", "n")
@@ -34,7 +37,8 @@ class L2Book:
         self.coin = coin
         self.last_update_ms: int = 0
         self.stale: bool = False  # parity with L4Book; L2 snapshots never gap
-        self.anomalies: list[dict] = []
+        self.anomalies: list[dict] = []  # newest ANOMALY_KEEP entries
+        self.anomaly_count: int = 0  # true total, immune to the cap
         self._bids: list[_Level] = []  # best first
         self._asks: list[_Level] = []  # best first
 
@@ -92,6 +96,12 @@ class L2Book:
     def _level_entry(level: _Level) -> dict:
         return {"px": level.px, "sz": float(level.size), "n": level.n}
 
+    def _anomaly(self, kind: str, **fields: Any) -> None:
+        self.anomaly_count += 1
+        self.anomalies.append({"type": kind, **fields})
+        if len(self.anomalies) > ANOMALY_KEEP:
+            del self.anomalies[: len(self.anomalies) - ANOMALY_KEEP]
+
     def _parse_side(self, levels: list[dict] | None, side: str) -> list[_Level]:
         parsed: list[_Level] = []
         for raw in levels or []:
@@ -100,7 +110,7 @@ class L2Book:
                     _Level(str(raw["px"]), Decimal(str(raw["sz"])), int(raw.get("n", 1)))
                 )
             except (KeyError, TypeError, ValueError, InvalidOperation):
-                self.anomalies.append({"type": "bad_level", "detail": repr(raw)})
+                self._anomaly("bad_level", detail=repr(raw))
         # The feed already orders levels best-first; re-sort defensively so a
         # misordered payload can't silently corrupt best/mid reads.
         parsed.sort(key=lambda lvl: lvl.price, reverse=(side == BID))

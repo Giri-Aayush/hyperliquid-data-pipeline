@@ -99,6 +99,43 @@ def test_flat_envelope_variant_also_detected():
     assert len(parsed.diffs) == 1
 
 
+def test_quiet_block_without_book_diffs_still_parses():
+    """A block emitting only order_statuses must yield an EMPTY batch, not
+    None — dropping it would false-flag height gaps on every book (audit)."""
+    quiet = json.dumps(
+        {"time": 1764867591000, "height": 101, "data": {"order_statuses": []}}
+    )
+    parsed = parse_line(quiet)
+    assert isinstance(parsed, BlockDiffBatch)
+    assert (parsed.time_ms, parsed.height, parsed.diffs) == (
+        1764867591000, 101, [],
+    )
+
+
+def test_bad_element_inside_block_is_reported_via_on_skip():
+    """A dropped element is the phantom-order corruption class (audit): the
+    block still parses, but the caller must see that something was dropped."""
+    envelope = json.dumps(
+        {
+            "time": 1,
+            "height": 2,
+            "data": {
+                "order_statuses": [],
+                "book_diffs": [
+                    json.loads(_event()),
+                    {"totally": "wrong"},
+                    json.loads(_event(oid=8)),
+                ],
+            },
+        }
+    )
+    skipped = []
+    parsed = parse_line(envelope, on_skip=skipped.append)
+    assert isinstance(parsed, BlockDiffBatch)
+    assert [d.oid for d in parsed.diffs] == [7, 8]
+    assert len(skipped) == 1 and "totally" in skipped[0]
+
+
 def test_strict_mode_names_unknown_diff_variant():
     line = _event(raw_book_diff={"modify": {"sz": "1.0"}})
     assert parse_line(line) is None  # tolerant by default

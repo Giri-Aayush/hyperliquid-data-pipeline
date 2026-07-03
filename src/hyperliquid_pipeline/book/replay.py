@@ -104,7 +104,7 @@ def replay(
         diffs_applied=diffs_applied,
         skipped_other_coin=skipped_other_coin,
         parse_skips=parse_skips,
-        anomaly_count=len(book.anomalies),
+        anomaly_count=book.anomaly_count,  # exact even when the list is capped
         anomalies=list(book.anomalies),
         stale=book.stale,
         crossed=book.is_crossed(),

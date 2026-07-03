@@ -32,6 +32,10 @@ from hyperliquid_pipeline.book.schemas import (
     L4Snapshot,
 )
 
+# A persistently malformed feed must not grow memory without bound: only the
+# newest dicts are kept; anomaly_count carries the true total.
+ANOMALY_KEEP = 1000
+
 
 class _PriceLevel:
     """One price level: FIFO order queue plus a cached total size."""
@@ -57,7 +61,8 @@ class L4Book:
         self.last_update_ms: int = 0
         self.height: int | None = None
         self.stale: bool = False
-        self.anomalies: list[dict] = []
+        self.anomalies: list[dict] = []  # newest ANOMALY_KEEP entries
+        self.anomaly_count: int = 0  # true total, immune to the cap
         self._orders: dict[int, _OrderRef] = {}
         # Both sides iterate best-first: bid keys are negated prices.
         self._bids: SortedDict = SortedDict()
@@ -78,6 +83,7 @@ class L4Book:
         self._bids.clear()
         self._asks.clear()
         self.anomalies = []
+        self.anomaly_count = 0
         self.stale = False
         if coin_mismatch:
             self._anomaly("snapshot_coin_mismatch", detail=snapshot.coin)
@@ -222,7 +228,10 @@ class L4Book:
         return {"px": level.px, "sz": float(level.total), "n": len(level.orders)}
 
     def _anomaly(self, kind: str, **fields: Any) -> None:
+        self.anomaly_count += 1
         self.anomalies.append({"type": kind, **fields})
+        if len(self.anomalies) > ANOMALY_KEEP:
+            del self.anomalies[: len(self.anomalies) - ANOMALY_KEEP]
 
     def _insert(self, oid: int, side: str, px: str, sz: str) -> None:
         try:
