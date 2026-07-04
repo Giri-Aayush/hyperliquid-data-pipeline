@@ -60,9 +60,10 @@ DEFAULT_HORIZONS_S: Tuple[float, ...] = (1.0, 5.0, 30.0)
 
 # Printed on every report on purpose: the numbers are easy to over-read.
 CAVEATS: Tuple[str, ...] = (
-    "short sample: a single capture session, one venue",
-    "windowed observations are autocorrelated (non-iid); the t-stat assumes "
-    "iid errors and therefore OVERSTATES significance",
+    "short sample: a single capture session/venue per input set",
+    "windowed observations are autocorrelated (non-iid): the iid t-stat "
+    "OVERSTATES significance; prefer the Newey-West t (t-NW), which is "
+    "itself no cure for a single regime",
     "no fees, latency, queueing, or adverse selection modeled",
     "a directional research read, not a strategy or a backtest",
 )
@@ -202,17 +203,18 @@ def aggregate_windows(
 # --- the read ----------------------------------------------------------------
 
 
-def forward_pairs(
+def forward_triples(
     events: Sequence[BboEvent],
     window_sums: Sequence[Tuple[int, float]],
     window_ms: int,
     horizon_ms: int,
-) -> List[Tuple[float, float]]:
-    """(window OFI, forward mid change) pairs.
+) -> List[Tuple[float, float, float]]:
+    """(window OFI, forward mid change, mid at window close) triples.
 
     The mid is read as a step function of exchange time (last observation at
-    or before t). A window only produces a pair when the full horizon is
-    observable inside the capture — no forward fill past the end.
+    or before t). A window only produces a triple when the full horizon is
+    observable inside the capture — no forward fill past the end. The third
+    element is the bps denominator for the decile table.
     """
     if not events:
         return []
@@ -223,7 +225,7 @@ def forward_pairs(
         i = bisect.bisect_right(times, t_ms) - 1
         return events[i].mid if i >= 0 else None
 
-    pairs: List[Tuple[float, float]] = []
+    triples: List[Tuple[float, float, float]] = []
     for start_ms, ofi in window_sums:
         end = start_ms + window_ms
         target = end + horizon_ms
@@ -233,18 +235,40 @@ def forward_pairs(
         mid_fwd = mid_at(target)
         if mid_now is None or mid_fwd is None:
             continue
-        pairs.append((ofi, mid_fwd - mid_now))
-    return pairs
+        triples.append((ofi, mid_fwd - mid_now, mid_now))
+    return triples
 
 
-def ols_stats(pairs: Sequence[Tuple[float, float]]) -> Dict[str, Any]:
+def forward_pairs(
+    events: Sequence[BboEvent],
+    window_sums: Sequence[Tuple[int, float]],
+    window_ms: int,
+    horizon_ms: int,
+) -> List[Tuple[float, float]]:
+    """(window OFI, forward mid change) pairs — see forward_triples."""
+    return [
+        (ofi, change)
+        for ofi, change, _ in forward_triples(
+            events, window_sums, window_ms, horizon_ms
+        )
+    ]
+
+
+def ols_stats(
+    pairs: Sequence[Tuple[float, float]], hac_lag: Optional[int] = None
+) -> Dict[str, Any]:
     """Slope/r/t for y ~ a + b*x over the pairs; None where undefined.
 
-    The t-stat is the textbook iid one — see CAVEATS for why it flatters.
+    ``t_stat`` is the textbook iid one — it flatters under autocorrelation.
+    With ``hac_lag`` set, ``t_hac`` is the Newey-West (Bartlett-kernel) t for
+    the slope with that many lags: the honest number when observations
+    overlap (forward horizon longer than the window). No small-sample
+    correction; windows with gaps are treated as adjacent — a research read,
+    not econometrics software.
     """
     n = len(pairs)
     if n < 3:
-        return {"n": n, "slope": None, "r": None, "t_stat": None}
+        return {"n": n, "slope": None, "r": None, "t_stat": None, "t_hac": None}
     xs = [x for x, _ in pairs]
     ys = [y for _, y in pairs]
     mean_x = sum(xs) / n
@@ -253,14 +277,84 @@ def ols_stats(pairs: Sequence[Tuple[float, float]]) -> Dict[str, Any]:
     syy = sum((y - mean_y) ** 2 for y in ys)
     sxy = sum((x - mean_x) * (y - mean_y) for x, y in pairs)
     if sxx == 0:  # constant OFI: no regressor variance, nothing to estimate
-        return {"n": n, "slope": None, "r": None, "t_stat": None}
+        return {"n": n, "slope": None, "r": None, "t_stat": None, "t_hac": None}
     slope = sxy / sxx
+    t_hac = None
+    if hac_lag is not None:
+        centered = [x - mean_x for x in xs]
+        residuals = [
+            (y - mean_y) - slope * xc for xc, y in zip(centered, ys)
+        ]
+        t_hac = _newey_west_t(centered, residuals, sxx, slope, hac_lag)
     if syy == 0:  # constant forward change: slope is 0 by construction
-        return {"n": n, "slope": slope, "r": None, "t_stat": None}
+        return {"n": n, "slope": slope, "r": None, "t_stat": None, "t_hac": t_hac}
     r = max(-1.0, min(1.0, sxy / math.sqrt(sxx * syy)))
     denom = 1.0 - r * r
     t_stat = float("inf") if denom <= 1e-15 else r * math.sqrt((n - 2) / denom)
-    return {"n": n, "slope": slope, "r": r, "t_stat": t_stat}
+    return {"n": n, "slope": slope, "r": r, "t_stat": t_stat, "t_hac": t_hac}
+
+
+def _newey_west_t(
+    centered_x: Sequence[float],
+    residuals: Sequence[float],
+    sxx: float,
+    slope: float,
+    lag: int,
+) -> Optional[float]:
+    """Bartlett-weighted HAC t for the slope of a simple centered OLS."""
+    n = len(residuals)
+    scores = [xc * u for xc, u in zip(centered_x, residuals)]
+    variance_sum = sum(g * g for g in scores)
+    for l in range(1, min(lag, n - 1) + 1):
+        weight = 1.0 - l / (lag + 1.0)
+        gamma = sum(scores[i] * scores[i - l] for i in range(l, n))
+        variance_sum += 2.0 * weight * gamma
+    if variance_sum <= 0:
+        # Perfect fit (all residuals zero) or a degenerate kernel sum.
+        return float("inf") if slope != 0 else None
+    return slope / (math.sqrt(variance_sum) / sxx)
+
+
+def decile_table(
+    triples: Sequence[Tuple[float, float, float]]
+) -> List[Dict[str, Any]]:
+    """Mean forward mid change (bps of the window-close mid) by OFI decile.
+
+    Rank-bucketed into up-to-10 equal-count buckets, decile 1 = most negative
+    OFI. Monotonically increasing means across deciles is the cleanest
+    model-free evidence that flow leads the mid.
+    """
+    n = len(triples)
+    if n == 0:
+        return []
+    buckets = min(10, n)
+    ordered = sorted(triples, key=lambda t: t[0])
+    table: List[Dict[str, Any]] = []
+    for b in range(buckets):
+        chunk = ordered[b * n // buckets : (b + 1) * n // buckets]
+        if not chunk:
+            continue
+        table.append(
+            {
+                "decile": b + 1,
+                "n": len(chunk),
+                "mean_ofi": sum(t[0] for t in chunk) / len(chunk),
+                "mean_fwd_bps": sum(1e4 * t[1] / t[2] for t in chunk) / len(chunk),
+            }
+        )
+    return table
+
+
+def _monotone_fraction(table: Sequence[Dict[str, Any]]) -> Optional[float]:
+    """Fraction of adjacent decile steps with non-decreasing mean fwd bps."""
+    if len(table) < 2:
+        return None
+    ups = sum(
+        1
+        for a, b in zip(table, table[1:])
+        if b["mean_fwd_bps"] >= a["mean_fwd_bps"]
+    )
+    return ups / (len(table) - 1)
 
 
 def analyze(
@@ -270,7 +364,7 @@ def analyze(
     horizons_s: Sequence[float] = DEFAULT_HORIZONS_S,
 ) -> Dict[str, Any]:
     """Full OFI read for one symbol: per (window, horizon [+ next-window])
-    OLS slope / correlation / t-stat / N, with the caveats attached."""
+    OLS slope / r / iid t / Newey-West t / decile table, caveats attached."""
     results: List[Dict[str, Any]] = []
     for window_s in windows_s:
         window_ms = int(round(window_s * 1000))
@@ -279,10 +373,22 @@ def analyze(
         # next-window read: forward change over exactly the following window.
         horizon_specs.append((f"next({window_s:g}s)", window_ms))
         for label, horizon_ms in horizon_specs:
-            stats = ols_stats(
-                forward_pairs(events, window_sums, window_ms, horizon_ms)
+            triples = forward_triples(events, window_sums, window_ms, horizon_ms)
+            # Observations overlap for ~horizon/window adjacent windows; that
+            # ratio is the natural HAC lag.
+            hac_lag = max(1, math.ceil(horizon_ms / window_ms))
+            stats = ols_stats([(o, dy) for o, dy, _ in triples], hac_lag=hac_lag)
+            table = decile_table(triples)
+            results.append(
+                {
+                    "window_s": window_s,
+                    "horizon": label,
+                    "hac_lag": hac_lag,
+                    **stats,
+                    "deciles": table,
+                    "monotone_fraction": _monotone_fraction(table),
+                }
             )
-            results.append({"window_s": window_s, "horizon": label, **stats})
     start_ms = events[0].t_ms if events else None
     end_ms = events[-1].t_ms if events else None
     return {
@@ -313,13 +419,25 @@ def _format_report(report: Dict[str, Any]) -> str:
         f"OFI read — {report['symbol']}: {report['events']} events over "
         f"{report['duration_s']:.1f}s",
         f"{'window':>8}  {'horizon':>10}  {'N':>6}  {'slope':>12}  "
-        f"{'r':>8}  {'t-stat':>8}",
+        f"{'r':>8}  {'t-iid':>8}  {'t-NW':>8}",
     ]
     for row in report["results"]:
         lines.append(
             f"{row['window_s']:>7g}s  {row['horizon']:>10}  {row['n']:>6}  "
             f"{fmt(row['slope'], '.3e'):>12}  {fmt(row['r'], '.3f'):>8}  "
-            f"{fmt(row['t_stat'], '.2f'):>8}"
+            f"{fmt(row['t_stat'], '.2f'):>8}  {fmt(row['t_hac'], '.2f'):>8}"
+        )
+    lines.append("deciles (mean fwd bps, most-negative OFI -> most-positive):")
+    for row in report["results"]:
+        table = row.get("deciles") or []
+        if not table:
+            continue
+        cells = " ".join(f"{d['mean_fwd_bps']:+.2f}" for d in table)
+        mono = row.get("monotone_fraction")
+        steps = len(table) - 1
+        mono_txt = f"{round(mono * steps)}/{steps} up" if mono is not None else "-"
+        lines.append(
+            f"  {row['window_s']:g}s/{row['horizon']}: {cells} | {mono_txt}"
         )
     lines.append("caveats:")
     lines.extend(f"  - {caveat}" for caveat in report["caveats"])

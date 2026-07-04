@@ -15,7 +15,9 @@ from hyperliquid_pipeline.research.ofi import (
     BboEvent,
     aggregate_windows,
     analyze,
+    decile_table,
     forward_pairs,
+    forward_triples,
     load_bbo_events,
     main,
     ofi_series,
@@ -102,13 +104,55 @@ def test_ols_stats_hand_computed_small_case():
 
 
 def test_ols_stats_degenerate_inputs():
-    assert ols_stats([]) == {"n": 0, "slope": None, "r": None, "t_stat": None}
+    assert ols_stats([]) == {
+        "n": 0, "slope": None, "r": None, "t_stat": None, "t_hac": None,
+    }
     assert ols_stats([(1, 2.0), (2, 3.0)])["slope"] is None  # n < 3
     constant_x = ols_stats([(5, 1.0), (5, 2.0), (5, 3.0)])
     assert constant_x["slope"] is None  # no regressor variance
     constant_y = ols_stats([(1, 4.0), (2, 4.0), (3, 4.0)])
     assert constant_y["slope"] == pytest.approx(0.0)
     assert constant_y["r"] is None
+
+
+def test_newey_west_t_hand_computed():
+    """Same 4-point case as above, worked by hand.
+
+    b=0.2, a=0.2, residuals (-0.2, 0.6, -0.6, 0.2), scores g = x_c*u =
+    (0.3, -0.3, -0.3, 0.3). Gamma0 = 0.36; lag1: w=0.5, Gamma1 = -0.09 ->
+    S = 0.36 - 0.09 = 0.27; Var(b) = S/sxx^2 = 0.27/25 -> t = 0.2/sqrt(0.0108).
+    With lag 0 (White/HC0): Var = 0.36/25 -> t = 5/3.
+    """
+    pairs = [(0, 0.0), (1, 1.0), (2, 0.0), (3, 1.0)]
+    assert ols_stats(pairs, hac_lag=1)["t_hac"] == pytest.approx(
+        0.2 / math.sqrt(0.0108)
+    )
+    assert ols_stats(pairs, hac_lag=0)["t_hac"] == pytest.approx(5 / 3)
+    # iid t is unchanged by the hac_lag argument.
+    assert ols_stats(pairs, hac_lag=1)["t_stat"] == ols_stats(pairs)["t_stat"]
+
+
+def test_newey_west_t_perfect_fit_is_infinite():
+    stats = ols_stats([(x, 2.0 * x + 1.0) for x in range(10)], hac_lag=3)
+    assert stats["t_hac"] == float("inf")
+
+
+def test_decile_table_is_monotone_on_a_linear_relation():
+    # dy = 0.001 * ofi around mid 100: deciles must rise strictly.
+    triples = [(float(k - 20), 0.001 * (k - 20), 100.0) for k in range(40)]
+    table = decile_table(triples)
+    assert len(table) == 10
+    assert all(d["n"] == 4 for d in table)
+    bps = [d["mean_fwd_bps"] for d in table]
+    assert bps == sorted(bps) and bps[0] < 0 < bps[-1]
+    # decile 1 holds the most negative OFI values
+    assert table[0]["mean_ofi"] < table[-1]["mean_ofi"]
+
+
+def test_decile_table_small_and_empty_inputs():
+    assert decile_table([]) == []
+    tiny = decile_table([(1.0, 0.01, 100.0), (2.0, 0.02, 100.0)])
+    assert len(tiny) == 2  # fewer observations than deciles: one per bucket
 
 
 def test_analyze_report_shape_and_caveats():
@@ -119,9 +163,14 @@ def test_analyze_report_shape_and_caveats():
     # one explicit horizon + the next-window read
     assert [row["horizon"] for row in report["results"]] == ["1s", "next(1s)"]
     assert all(
-        {"window_s", "horizon", "n", "slope", "r", "t_stat"} <= row.keys()
+        {
+            "window_s", "horizon", "n", "slope", "r", "t_stat",
+            "t_hac", "hac_lag", "deciles", "monotone_fraction",
+        }
+        <= row.keys()
         for row in report["results"]
     )
+    assert report["results"][0]["hac_lag"] == 1  # 1s horizon / 1s window
     assert report["caveats"]  # the honest part is not optional
 
 
@@ -264,10 +313,13 @@ def test_cli_prints_tables_and_writes_json(tmp_path, capsys):
     out = capsys.readouterr().out
     assert exit_code == 0
     assert "OFI read — BTC" in out
+    assert "t-NW" in out
+    assert "deciles" in out
     assert "caveats:" in out
     reports = json.loads(out_json.read_text())
     assert len(reports) == 1 and reports[0]["symbol"] == "BTC"
     assert [r["horizon"] for r in reports[0]["results"]] == ["1s", "2s", "next(1s)"]
+    assert all("deciles" in r and "t_hac" in r for r in reports[0]["results"])
 
 
 def test_cli_fails_cleanly_on_unusable_input(tmp_path, capsys):
