@@ -120,6 +120,25 @@ same honesty rules as the OFI reports.
   (px, sz, side, queue_bound, t, mid_at_fill). Exact signatures agreed in
   review before either side writes code.
 
+## First real-data run (v1 reference policy, 60-min capture 2026-07-03)
+
+Verified jointly (decomposition identity exact on all 18 grid cells). The
+reference touch-joiner loses ~4.4–6.6 bps of filled notional per coin against
+a max theoretical capture ~10x smaller. **Two structural costs, ranking
+coin-dependent**: fees are #1 on BTC ($16.5 of $25 lost); **stale-quote
+pickoffs are #1 on ETH and SOL** (ETH $9.4 vs $8.3 fees; SOL $28.1 vs $22.9).
+SOL's headline −$58 includes a −$13.7 terminal-inventory mark (an artifact,
+not flow economics: flow loss ≈ −$44.5). Post-fill 5s drift is positive on
+all coins (fills aren't purely toxic). The verdict is robust to the queue
+bound (fills 342/352/359 on BTC across pessimistic→optimistic; SOL is
+sweep-dominated and nearly bound-invariant), and conservatively UNDERSTATED
+(`crossed_unfilled` fills would add fees). The latency axis (400 vs 200 ms)
+is unmeasurable on L2 tapes — snapshots arrive ~600 ms apart, so both delays
+quantize to the same block; measuring latency effects requires block-cadence
+L4 data. **v2 direction**: quote wider than fee + expected adverse selection,
+and model the maker-rebate tier path — the fee term flips sign at volume
+tiers.
+
 ## Non-goals (v1)
 
 Self-impact, multi-venue, order-type zoo (post-only/IOC only), spot, live
