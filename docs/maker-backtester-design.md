@@ -1,9 +1,36 @@
-# Event-driven maker backtester — design (v1 draft)
+# Event-driven maker backtester — design (v1.1, contract LOCKED)
 
-**Status:** joint design in review (CTO draft, SDE reviewing) · **Phase:**
-post-strategy-sign-off (market-making, docs/strategy-memo.md) · **Package:**
-`src/hyperliquid_pipeline/sim/` — deliberately separate from the bar-level
-`backtest/` (different machine; only the metrics philosophy carries over).
+**Status:** jointly reviewed and locked 2026-07-04 (CTO draft, SDE review
+amendments accepted) · **Phase:** post-strategy-sign-off (market-making,
+docs/strategy-memo.md) · **Package:** `src/hyperliquid_pipeline/sim/` —
+deliberately separate from the bar-level `backtest/`.
+
+## Review amendments (accepted, superseding the draft below where they differ)
+
+1. **Queue bounds corrected:** pro-rata is a CENTRAL estimate, not a bound.
+   True bracket: PESSIMISTIC = cancels all land behind us (floor; queue-ahead
+   decays via trades only) · PRORATA = central · OPTIMISTIC = cancels all land
+   ahead (ceiling). One estimator parameterized by cancel location; decision
+   rule: a policy must clear PESSIMISTIC. When real L4 lands, the empirical
+   cancel-ahead fraction becomes a calibrated config value.
+2. **One QueueSim instance per (coin, bound); grid cells run as independent
+   passes** — fills diverge across bounds, so inventory and policy behavior
+   diverge; tagging fills in a shared pass would contaminate counterfactuals.
+3. **Block-replay pins:** engine delivers all of block N's trades BEFORE
+   on_book(N) (book diffs already embed trade effects — double-count guard);
+   in EXACT mode queue-ahead is maintained from book diffs only, trades only
+   compute OUR fills; on_book fires for every block including quiet ones and
+   carries the BlockDiffBatch in L4 mode; on `view.stale` the engine cancels
+   all virtual orders (stale_evictions counted). TradeEvent.side is the
+   AGGRESSOR side ('B' taker buy consumes ask queues). Book-only crossings do
+   not fill in v1 (crossed_unfilled counter): no print, no fill.
+4. **Frozen signatures** (see SDE review, IPC 2026-07-04): BookEvent,
+   TradeEvent, QueueBound{PESSIMISTIC,PRORATA,OPTIMISTIC,EXACT},
+   QueueSim.place/cancel/on_trade/on_book/queue_ahead/open_orders/get_stats,
+   Fill(order_id, coin, side=our resting side, px, sz, t_ms, height,
+   queue_bound, queue_ahead_at_fill, mid_at_fill, maker). QueueSim is
+   latency-free; latency is 100% engine-side. The Δt-later mid for adverse
+   selection is computed by the report from the stream, keeping Fill causal.
 
 ## What it must answer
 
