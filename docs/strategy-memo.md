@@ -1,8 +1,8 @@
 # Strategy-class memo: market-making first
 
 **Date:** 2026-07-04 · **Universe:** BTC, ETH, SOL perpetuals on Hyperliquid ·
-**Status:** recommendation, pending sign-off. This closes the decision the
-original design handoff deferred: build toward **market-making** or **taking**?
+**Status:** SIGNED OFF 2026-07-04. This closes the decision the original
+design handoff deferred: the system builds toward **market-making**.
 
 ## Recommendation
 
