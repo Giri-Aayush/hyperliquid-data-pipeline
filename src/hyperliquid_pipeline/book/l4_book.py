@@ -195,6 +195,22 @@ class L4Book:
             size_ahead += size
         return (ahead, float(size_ahead))
 
+    def level_orders(self, side: str, px: str) -> list[tuple[int, float]]:
+        """The resting orders at one price level in FIFO order, as
+        ``(oid, size)`` pairs — empty list if the level doesn't exist.
+
+        Read-only view for consumers that overlay virtual orders on the
+        replayed book (the maker simulator snapshots its queue-ahead here).
+        """
+        try:
+            key = self._level_key(side, px)
+        except (InvalidOperation, TypeError):
+            return []
+        level = self._side(side).get(key)
+        if level is None:
+            return []
+        return [(oid, float(size)) for oid, size in level.orders.items()]
+
     def checksum(self) -> str:
         """Deterministic digest of full book state (levels, FIFO order, sizes).
 

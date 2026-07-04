@@ -255,22 +255,43 @@ class QueueSim:
         return sorted(keys, key=lambda k: -k[1] if side == BID else k[1])
 
     def _fill_through(self, level: _Level, side: str, trade: Any) -> List[Fill]:
-        """Price printed through our level: everything of ours there fills."""
-        fills = []
-        ahead_at_fill = self._real_ahead_of_first_own(level)
-        for segment in level.own_segments():
-            if segment.sz > _EPS:
-                fills.append(self._emit(segment.oid, side, level, segment.sz, trade, ahead_at_fill))
+        """Price printed through our level: everything of ours there fills.
+
+        ``queue_ahead_at_fill`` is each order's real queue ahead AT TRADE
+        ARRIVAL (own volume not counted) — the fill-quality number; it is
+        recorded, not consumed, since a through-print means the whole level
+        executed before it regardless of position.
+        """
+        fills: List[Fill] = []
+        arrival_ahead = 0.0
+        skip = level.consumed_in_block if self._exact else 0.0
+        for segment in level.segments:
+            if segment.kind == "real":
+                available = segment.sz
+                if self._exact:
+                    already = min(available, skip)
+                    skip -= already
+                    available -= already
+                arrival_ahead += available
+            elif segment.sz > _EPS:
+                fills.append(
+                    self._emit(segment.oid, side, level, segment.sz, trade, arrival_ahead)
+                )
                 segment.sz = 0.0
         self._sweep_filled(level)
         return fills
 
     def _fill_at_price(self, level: _Level, side: str, trade: Any) -> List[Fill]:
-        """Trade at exactly our price: walk the merged FIFO from the front."""
+        """Trade at exactly our price: walk the merged FIFO from the front.
+
+        ``arrival_ahead`` accumulates the real volume encountered ahead of
+        each own order BEFORE this trade consumes it — queue position at
+        trade arrival, per order.
+        """
         budget = float(trade.sz)
         skip = level.consumed_in_block if self._exact else 0.0
         fills: List[Fill] = []
-        real_ahead_walked = 0.0
+        arrival_ahead = 0.0
         for segment in level.segments:
             if budget <= _EPS:
                 break
@@ -280,6 +301,7 @@ class QueueSim:
                     already = min(available, skip)
                     skip -= already
                     available -= already
+                arrival_ahead += available
                 take = min(budget, available)
                 if take > 0:
                     if self._exact:
@@ -287,28 +309,16 @@ class QueueSim:
                     else:
                         segment.sz -= take
                     budget -= take
-                real_ahead_walked += available - take
             else:
                 take = min(budget, segment.sz)
                 if take > _EPS:
                     fills.append(
-                        self._emit(segment.oid, side, level, take, trade, real_ahead_walked)
+                        self._emit(segment.oid, side, level, take, trade, arrival_ahead)
                     )
                     segment.sz -= take
                     budget -= take
         self._sweep_filled(level)
         return fills
-
-    def _real_ahead_of_first_own(self, level: _Level) -> float:
-        ahead = 0.0
-        budget = level.consumed_in_block if self._exact else 0.0
-        for segment in level.segments:
-            if segment.kind == "own":
-                return max(0.0, ahead)
-            take = min(segment.sz, budget)
-            budget -= take
-            ahead += segment.sz - take
-        return max(0.0, ahead)
 
     def _emit(
         self,

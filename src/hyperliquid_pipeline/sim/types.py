@@ -84,10 +84,12 @@ class Fill:
     """One (partial) fill of a virtual resting order.
 
     ``side`` is OUR resting side (not the aggressor). ``queue_ahead_at_fill``
-    is the modeled queue still ahead when the print reached us — the
-    fill-quality distribution is the whole point of queue modeling. The mid
-    Δt after the fill (adverse selection) is deliberately NOT here: the report
-    computes it from the stream so Fill stays causal.
+    is the modeled REAL volume ahead of that order at TRADE ARRIVAL (own
+    orders not counted; measured before the print consumes anything — the
+    post-consumption number would trivially be ~0). The fill-quality
+    distribution is the whole point of queue modeling. The mid Δt after the
+    fill (adverse selection) is deliberately NOT here: the report computes it
+    from the stream so Fill stays causal.
     """
 
     order_id: int
