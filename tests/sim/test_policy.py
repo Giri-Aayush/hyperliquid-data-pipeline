@@ -81,6 +81,58 @@ def test_no_quotes_on_crossed_book():
     assert [a.kind for a in actions] == ["cancel"]  # pull everything, place nothing
 
 
+def test_width_policy_quotes_behind_the_touch():
+    from hyperliquid_pipeline.sim.policy import WidthPolicy
+
+    policy = WidthPolicy(quote_size=1.0, width_ticks=2)
+    view = _View(bid_px="100.5", ask_px="100.6")  # tick inferred: 0.1
+    actions = policy.on_block(view, 0.0, [], T0, [])
+    placed = {(a.side, a.px) for a in actions if a.kind == "place"}
+    assert placed == {("B", "100.3"), ("A", "100.8")}  # 2 ticks behind each touch
+
+
+def test_width_zero_joins_the_touch():
+    from hyperliquid_pipeline.sim.policy import WidthPolicy
+
+    policy = WidthPolicy(quote_size=1.0, width_ticks=0)
+    actions = policy.on_block(_View(bid_px="100.5", ask_px="100.6"), 0.0, [], T0, [])
+    placed = {(a.side, a.px) for a in actions if a.kind == "place"}
+    assert placed == {("B", "100.5"), ("A", "100.6")}
+
+
+def test_width_policy_skews_asymmetrically_on_buy_pressure():
+    from hyperliquid_pipeline.sim.policy import WidthPolicy
+
+    policy = WidthPolicy(quote_size=1.0, width_ticks=2, skew_gain=1.0, ofi_warmup=0)
+    actions = []
+    for i in range(5):  # growing bid size at same px -> positive OFI, signal -> +3
+        view = _View(bid_px="100.5", ask_px="100.6", bid_sz=2.0 + i)
+        actions = policy.on_block(view, 0.0, [], T0 + i * 100, [])
+    placed = dict((a.side, a.px) for a in actions if a.kind == "place")
+    # buy pressure: bid tightens toward the touch (offset clamps at 0 = join),
+    # ask backs off to width+shift = 5 ticks: 100.6 + 0.5 = 101.1, plain string
+    assert placed["B"] == "100.5"
+    assert placed["A"] == "101.1"
+
+
+def test_width_policy_funding_tilt_prefers_short():
+    from hyperliquid_pipeline.sim.policy import WidthPolicy
+
+    policy = WidthPolicy(quote_size=1.0, width_ticks=2, funding_tilt_ticks=1.0)
+    actions = policy.on_block(_View(bid_px="100.5", ask_px="100.6"), 0.0, [], T0, [])
+    placed = dict((a.side, a.px) for a in actions if a.kind == "place")
+    assert placed["B"] == "100.2"  # bid backs off one extra tick
+    assert placed["A"] == "100.7"  # ask tightens one tick
+
+
+def test_width_policy_inventory_band():
+    from hyperliquid_pipeline.sim.policy import WidthPolicy
+
+    policy = WidthPolicy(quote_size=1.0, width_ticks=1, inventory_limit=2.0)
+    actions = policy.on_block(_View(), inventory=2.5, open_orders=[], t_ms=T0, fills=[])
+    assert {a.side for a in actions if a.kind == "place"} == {"A"}
+
+
 def test_rolling_ofi_warmup_suppresses_early_signal():
     ofi = _RollingOfi(window_ms=1000, warmup=5)
     view = _View()
