@@ -1,250 +1,179 @@
 # hyperliquid-data-pipeline
 
 [![tests](https://github.com/Giri-Aayush/hyperliquid-data-pipeline/actions/workflows/tests.yml/badge.svg)](https://github.com/Giri-Aayush/hyperliquid-data-pipeline/actions/workflows/tests.yml)
-![python](https://img.shields.io/badge/python-3.11%2B-blue)
-![license](https://img.shields.io/badge/license-MIT-green)
 
-The research foundation of a **market-making system for Hyperliquid perpetuals** (BTC/ETH/SOL), grown out of a market-data pipeline. It captures event-level market data losslessly with dual timestamps (exchange time + local receive time), reconstructs order books — down to per-order FIFO queue position from node data — measures feed latency, and drives an **event-driven maker simulator** that answers the only question that matters before risking capital: *does a quoting policy clear its costs, net of fees, on every day and in every regime?*
+Getting clean Hyperliquid market data is harder than it should be: the public WebSocket sends full L2 snapshots rather than deltas, disconnects leave silent holes in the stream, timestamps arrive without any record of when you received them, and the historical archive is a requester-pays S3 bucket of LZ4 files in a wrapper format the docs only partially describe. This pipeline ingests both sources into one system: every event carries the exchange timestamp and a local receive stamp taken before parsing, raw frames can be spooled losslessly, order books are reconstructed down to per-order FIFO queue position, and the output lands as JSONL, Parquet, and optional database rows ready for research.
 
-```
- feeds                        book (market state)        research & simulation
- ─────                        ───────────────────        ─────────────────────
- public WS: bbo · l2Book ──┬─▶ L2Book (snapshots)  ──┬─▶  OFI signal research (research/)
-   trades · asset ctx      │   L4Book (per-order,    │    maker sim: queue model (3 bounds),
- node raw book diffs ──────┘     queue position)     │      latency, fees, funding, PnL
- S3 archive (history) ─────┐   one BookView protocol │      decomposition (sim/)
-                           │                         ▼    parameter sweep + live gate
-                           └─▶ process ─▶ validate ─▶ store ─▶ bar backtest (Sharpe, PnL, DD)
-                                  │                            capture & storage:
-                                  │                            raw-frame spool (lossless WAL) ·
-                                  │                            Postgres · InfluxDB · Redis ·
-                                  │                            JSONL · Parquet/R2
- measurement: per-channel feed-latency histograms · rerunnable ws-latency bench (SNTP-corrected)
-```
+It is a data and research system, not a trading system. Nothing in this repository signs, places, or cancels an order.
 
-> **Status (honest):** this is a validated *research testbed*, not a profitable system. The order-flow-imbalance signal is real (see below), but no simulated policy clears the cost gate yet, and there is **no live-execution layer** — nothing here places a real order. See [Status & findings](#status--findings) for exactly what works and what doesn't.
+## Quickstart
 
-## Try it in 30 seconds
-
-No keys, no databases. Connects to the public WebSocket and prints live BTC data:
+No keys and no databases required. This connects to the public WebSocket and prints live BTC data for 30 seconds:
 
 ```bash
-git clone https://github.com/Giri-Aayush/hyperliquid-data-pipeline.git
-cd hyperliquid-data-pipeline
+git clone https://github.com/Giri-Aayush/hyperliquid-data-pipeline.git && cd hyperliquid-data-pipeline
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python scripts/run_pipeline.py test-realtime --symbols BTC --duration 30
 ```
 
-```
-| INFO | Connecting to wss://api.hyperliquid.xyz/ws
-| INFO | WebSocket connected successfully
-| INFO | Sent 3 subscriptions
-| INFO | Received orderbook for BTC
-| INFO | Received trade for BTC
-| INFO | Received ticker for BTC
-```
-
-## Examples
-
-Three runnable scripts in [`examples/`](examples) that show the analytical output, not just the plumbing.
-
-**Live orderbook microstructure** — spread, depth, and imbalance off each snapshot:
+To persist a research capture instead (all streams to JSONL with dual timestamps):
 
 ```bash
-python examples/orderbook_metrics.py --symbol BTC --duration 30
+.venv/bin/python scripts/capture.py --symbols BTC,ETH,SOL --duration 3600 --output data/research_capture
 ```
 
+## Architecture
+
+Four ingestion paths feed a shared book core and a set of sinks. The live WebSocket path is built so that a slow consumer can never stall the socket: the read loop stamps, spools, parses, and enqueues; a separate task runs the callbacks.
+
+```mermaid
+flowchart LR
+    subgraph SRC[Sources]
+        WS["Public WebSocket<br/>bbo, l2Book, trades,<br/>allMids, activeAssetCtx"]
+        S3[("hyperliquid-archive S3<br/>LZ4, requester-pays")]
+        NODE["Node raw book diffs<br/>(hourly files)"]
+        QN["QuickNode gRPC<br/>StreamL4Book"]
+    end
+
+    WS -->|"raw frame, before parsing"| SPOOL["RawSpool<br/>hourly JSONL WAL<br/>(opt-in)"]
+    WS -->|"stamp recv_ts_ms,<br/>recv_mono_ns, parse"| Q["Bounded queue<br/>(drop-oldest)"]
+    Q --> LOG["DataLogger<br/>per-stream daily JSONL"]
+    Q --> PROC["DataProcessor<br/>OHLCV, book metrics,<br/>indicators, validation"]
+    WS -.->|"gap detected<br/>on reconnect"| BF["Trade backfill<br/>from archive"]
+    BF -->|"storage + JSONL only,<br/>bypasses processor"| LOG
+
+    S3 --> HIST["HistoricalDataCollector"]
+    HIST <-->|"read-through raw cache"| OBJ[("Object store<br/>R2 / S3 / B2 / MinIO")]
+    HIST --> PQ["Parquet<br/>per symbol, per type"]
+    PQ -->|mirror| OBJ
+    LOG -->|"upload on rollover<br/>and shutdown"| OBJ
+
+    PROC --> BATCH["BatchingStorage"]
+    BATCH --> PG[("PostgreSQL<br/>JSONB")]
+    BATCH --> IX[("InfluxDB")]
+    BATCH --> RD[("Redis")]
+
+    NODE --> DIFF["diff_parser"]
+    QN --> DIFF
+    DIFF --> L4["L4Book<br/>per-order FIFO queue"]
+    Q --> L2["L2Book<br/>snapshot book"]
+    L4 --> BV["BookView protocol"]
+    L2 --> BV
+    BV --> SIM["Maker simulator<br/>+ deterministic replay"]
+    LOG --> OFI["OFI signal research"]
+    PQ --> BT["Bar backtester"]
 ```
-time                mid  spread(bps)   imbalance       depth@5 bid/ask
-----------------------------------------------------------------------
-15:13:24    63,773.50         0.16      +0.670      23.80 / 1.88
-15:13:25    63,773.50         0.16      +0.660      23.80 / 1.88
+
+Component map:
+
+| Path | Module | Role |
+|---|---|---|
+| Live feed | `collectors/realtime_collector.py` | WebSocket client for bbo, l2Book, trades, allMids, activeAssetCtx, and user events (when a wallet address is configured). Full-jitter exponential reconnect backoff (base 5 s, cap 60 s). Per-channel feed-latency histograms. |
+| Lossless capture | `collectors/spool.py` | Every raw frame appended to hourly JSONL before parsing, independent of the drop-oldest queue, so load shedding cannot punch holes in the archive. Off by default (`SPOOL_ENABLED=true`). |
+| Gap repair | `collectors/backfill.py` | On reconnect, gaps over 5 s (configurable) trigger an attempted trade backfill from the S3 archive. Recovered points go straight to storage and JSONL, bypassing the processor. In practice the archive publishes no trades (see Limitations), so this path recovers nothing from that source today. |
+| History | `collectors/historical_collector.py` | Pulls `market_data/<date>/<hour>/l2Book/<coin>.lz4` and `asset_ctxs/<date>.csv.lz4` from the requester-pays archive, unwraps the on-disk record format, and writes Parquet. A `trades` location is implemented, but the bucket's `market_data` prefix contains only `l2Book` hours. |
+| Book core | `book/` | `L4Book` (order-level, from node diffs, with `queue_position`), `L2Book` (snapshot book), one frozen `BookView` read protocol over both, a strict-mode diff parser, and a deterministic replay CLI that reports a checksum. |
+| Node feeds | `collectors/node_feed.py`, `collectors/quicknode_feed.py` | Drive `L4Book`s from node `--write-raw-book-diffs` files (offline replay or live tail) or from QuickNode's `StreamL4Book` gRPC stream (`protos/orderbook.proto`). |
+| Processing | `processors/data_processor.py` | Trades to OHLCV with VWAP, book metrics through `BookView`, technical indicators, asset-context join. |
+| Validation | `utils/validation.py` | Crossed books, bad sort order, price jumps, volume spikes, stale and duplicate points. |
+| Storage | `storage/database.py`, `storage/object_store.py` | PostgreSQL, InfluxDB, Redis (each optional; unreachable backends are skipped with a warning), wrapped in a batching writer. S3-compatible object store as raw cache and output mirror. |
+| Scheduling | `scheduler/orchestrator.py` | APScheduler jobs: daily history pull at 01:00 UTC, quality report every 6 hours, stats every 30 minutes. Clean shutdown on signals. |
+| Research | `research/ofi.py` | Cont, Kukanov and Stoikov best-level order-flow imbalance over captured bbo or archive hours, with windowed forward-return regression, Newey-West t-statistics, and decile tables. |
+| Simulation | `sim/` | Event-driven maker simulator: virtual orders in a merged FIFO queue over replayed books, three L2 cancel bounds (pessimistic, pro-rata, optimistic) plus an exact L4 mode, configurable submit latency (default 400 ms), 1.5 bps maker fee, hourly funding accrual, PnL decomposition (spread capture, post-fill drift, fees, funding, mark residual), and a parameter sweep with a pass/fail gate. |
+| Backtesting | `backtest/` | Vectorized bar engine with no lookahead (signals shifted one bar), per-side fee and slippage in bps, long/short/flat via a target position in [-1, 1]. |
+| Latency bench | `bench/ws_latency.py` | Exact per-channel latency percentiles with an SNTP clock-offset estimate; the same command re-runs unchanged from another host for comparison. |
+
+## Data outputs
+
+### Live JSONL
+
+`DataLogger` writes one file per symbol, stream, and UTC day: `data/realtime/{SYMBOL}_{data_type}_{YYYYMMDD}.jsonl`. Each line is a serialized `MarketDataPoint`:
+
+```json
+{"timestamp": "<ISO 8601>", "symbol": "BTC", "data_type": "...", "data": {...}, "recv_ts_ms": 1718300000123.4, "recv_mono_ns": 123456789}
 ```
 
-**Indicator engine** — RSI, EMAs, and Bollinger bands over a price series (deterministic, no network):
+`timestamp` is exchange time where the feed provides one (bbo, l2Book, trades) and local time otherwise (allMids, activeAssetCtx). `recv_ts_ms` and `recv_mono_ns` are stamped at the socket read, before parsing. The `data` payload per stream:
 
-```bash
-python examples/ohlcv_indicators.py
-```
-
-```
- bar       close     rsi      ema_10    bb_upper    bb_lower
-------------------------------------------------------------
-  30   48,325.73     4.4   48,699.66   50,189.33   48,101.03
-  50   48,335.55    60.3   48,146.32   48,304.05   47,923.26
-  60   48,517.08    70.2   48,383.43   48,582.64   47,864.89
-```
-
-**Backtest** — run a strategy over the collected OHLCV and report PnL, Sharpe, drawdown, win rate (deterministic, no network):
-
-```bash
-python examples/backtest_demo.py
-```
-
-```
-=== SMA 10/30 ===
-return           -35.53%
-Sharpe             -0.50
-max drawdown     -66.21%
-win rate          28.33%
-profit factor       1.02
-trades                60
-```
-
-The engine has **no lookahead** (a signal from bar *i*'s close is acted on at *i+1*), charges fees and slippage on every position change, and supports long/short/flat. Point it at real data with `backtest.data.from_csv(...)` or `from_trades_parquet(...)` (the Parquet this pipeline writes). See [Backtesting](#backtesting).
-
-## What the data shows
-
-To show the pipeline captures real market activity, here is a six-minute live capture of BTC perps (2026-06-13, 18:51–18:57 UTC): 663 orderbook snapshots, 800 trades, and the per-second mark, oracle, and book metrics the pipeline computes. Regenerate it with `python examples/analyze_btc_capture.py`.
-
-![BTC perps microstructure over a six-minute live capture](docs/btc-microstructure.png)
-
-Three things stood out in this window. It's a short sample, not a study, but every number is real:
-
-- **The perp traded at a steady discount to the index.** The mark price sat 3.9 to 5.9 bps below the oracle (index) price for the whole six minutes (mean -4.9 bps) and never crossed above it. A persistent negative mark-minus-oracle basis tends to move with funding pressure, and it's exactly what the `activeAssetCtx` feed and the computed basis exist to surface.
-- **The book is tight and stable.** Median spread was 0.16 bps (about $1 on a ~$64,100 mid), and the 95th percentile was the same, so the quoted top of book barely moved for almost the whole window. The few brief widenings show up as the spikes in the spread panel.
-- **Orderbook imbalance flips fast, and didn't cleanly lead price here.** It swung between strongly bid- and ask-heavy on a seconds timescale (mean +0.24, average magnitude 0.57) while the mid drifted up about 8 bps. Over six minutes I wouldn't read that as predictive; it's a reminder that a microstructure signal needs far more than a short window to judge.
-
-The chart and a summary JSON come from [`examples/analyze_btc_capture.py`](examples/analyze_btc_capture.py), so you can point it at a longer window or another symbol and redraw it.
-
-## What's in it
-
-| Module | Does |
+| `data_type` | Fields |
 |---|---|
-| `collectors/realtime_collector.py` | WebSocket feeds — **bbo (event-level top-of-book)**, l2Book, trades, mids, asset ctx, user events — every frame stamped with local receive time; full-jitter reconnect backoff; per-channel feed-latency histograms in `get_stats()` |
-| `collectors/spool.py` | Lossless capture: every raw frame to hourly JSONL **before** parsing, independent of the drop-oldest processing queue — bursts can't punch holes in the archive |
-| `collectors/historical_collector.py` | Pulls L2 snapshots and trades from the `hyperliquid-archive` S3 bucket (LZ4, requester-pays) |
-| `book/` | The market-state core: `L4Book` (order-by-order reconstruction from node raw book diffs, FIFO queue-position queries), `L2Book` (snapshot book), one frozen `BookView` read protocol behind both, a strict-mode diff parser, and a deterministic replay engine + CLI |
-| `bench/` | Feed-latency benchmark: exact per-channel percentiles with an SNTP clock-offset correction; the identical command re-runs from a colocated host |
-| `sim/` | Event-driven **maker simulator**: virtual orders in a merged-FIFO queue over replayed books (pessimistic/prorata/optimistic cancel bounds + exact L4 mode), engine with action latency and a fee/funding ledger, a reference OFI-skew quoting policy, PnL decomposition (spread capture vs adverse selection), and a parameter sweep whose gate demands profit on *every* day and regime |
-| `research/` | `ofi.py` — Cont–Kukanov–Stoikov order-flow imbalance over captured bbo and archive hours, windowed forward-return regression with Newey–West t-stats and decile tables |
-| `processors/data_processor.py` | Trades → OHLCV with VWAP; SMA/EMA/RSI/Bollinger; book metrics read through `BookView` — spread (bps), depth, imbalance (all-levels and spoof-resistant top-5) |
-| `utils/validation.py` | Crossed books, bad sort order, price jumps, volume spikes, stale and duplicate points |
-| `storage/database.py` | One interface, three DB backends: PostgreSQL (asyncpg, lossless JSONB + capture stamps), InfluxDB, Redis. Use any subset (each optional) |
-| `storage/object_store.py` | S3-compatible object store (Cloudflare R2 / AWS S3 / Backblaze / MinIO): caches raw pulls, stores Parquet output, mirrors spool + JSONL files |
-| `scheduler/orchestrator.py` | APScheduler jobs for daily history pulls and quality reports; clean shutdown on signals |
-| `backtest/` | Run a strategy over the collected OHLCV: no-lookahead engine, fees + slippage, long/short, and a metrics report (Sharpe, Sortino, drawdown, win rate, profit factor, expectancy) |
+| `bbo` | `bid`, `ask` (raw level dicts `{px, sz, n}` with exact string prices, either side may be null), `timestamp_ms` |
+| `orderbook` | `bids`, `asks` (lists of raw level dicts), `timestamp_ms` |
+| `trade` | `price`, `size`, `side`, `timestamp_ms`, `trade_id` |
+| `ticker` | `mid_price`, `timestamp_ms` (local clock) |
+| `asset_ctx` | `mark_price`, `oracle_price`, `mid_price`, `open_interest`, `funding`, `premium`, `basis`, `basis_bps`, `timestamp_ms` (local clock) |
 
-### The HFT capture path
+### Raw spool
 
-Priorities follow where the edge actually lives on this venue: **freshness of top-of-book beats depth**, order-level data beats aggregates, and none of it is worth much if you can't measure your own latency.
+With `SPOOL_ENABLED=true`, every raw WebSocket frame lands in hourly files under `data/spool/`, one line per frame: `{"recv_ts_ms": ..., "recv_mono_ns": ..., "raw": <frame>}`, where the frame is embedded verbatim as a raw JSON value, not re-quoted. This stores the wire bytes, not the parsed interpretation, so it survives parser bugs.
 
-- **bbo first.** The `bbo` channel pushes only when the best bid/ask changes on a block — the highest-signal, lowest-cost feed. Subscribed by default (`SUBSCRIBE_BBO=false` to opt out).
-- **Dual timestamps everywhere.** Every point carries the exchange event time *and* `recv_ts_ms`/`recv_mono_ns` stamped at the socket read, before parsing. Feed latency is measured per channel into log-bucketed histograms (`get_stats()["latency_ms"]`) and benchmarked exactly with `scripts/bench_ws_latency.py` — run it now for a baseline, re-run it unchanged from a Tokyo host after colocating.
-- **Lossless spool.** Set `SPOOL_ENABLED=true` on a capture host and every raw frame lands in `data/spool/` hourly files regardless of what the processing path drops under load.
-- **Node-ready.** `HYPERLIQUID_WS_URL` points the same collector at a colocated node; the `book/` diff parser reads `--write-raw-book-diffs` output (run your first real node hour with `strict=True` — any format drift raises with the offending keys named). `python -m hyperliquid_pipeline.book.replay <snapshot> <diffs…>` rebuilds a book deterministically from recorded data.
+### Historical Parquet
 
-## Status & findings
+`collect-historical` writes `<output_dir>/<symbol>/<data_type>.parquet`, indexed by a millisecond-resolution `timestamp`:
 
-An honest account of where this stands, because a testbed that lies to you is worse than none.
+- `trades.parquet`: `symbol`, `price` (float), `size` (float), `side`, `trade_id`
+- `l2Book.parquet`: `symbol`, `bids`, `asks` (raw level lists)
 
-**What's validated:**
-- **The OFI signal is real and reproduces.** Order-flow imbalance predicts short-horizon mid moves across two independent samples (a live hour and April-2026 archive hours), r ≈ 0.22–0.33 at a 1-second horizon, decaying to noise by 30s, with monotone decile tables. Textbook Cont–Kukanov–Stoikov behaviour on real Hyperliquid data. It is an ingredient, not a strategy.
-- **The infrastructure works end-to-end**: lossless capture, order-book reconstruction, the simulator, and the research pipeline are built and tested (`pytest tests/` — a few hundred behaviour-contract tests, no network).
+Raw LZ4 pulls are cached in the object store under `raw/<bucket>/<key>` (pay AWS once, re-read from your own bucket), and Parquet output is mirrored under `processed/`.
 
-**What does *not* work yet:**
-- **No profitable policy.** Every simulated quoting policy loses. The reference touch-joiner loses ~4.4–6.6 bps of filled notional per hour — because at Tier-0 fees (1.5 bp maker) the max spread capture is ~10× smaller than the fee, and stale quotes get picked off during the latency window. Quoting wider (the v2 `WidthPolicy`) cuts the loss sharply but has not cleared the gate on the tape captured so far.
-- **No live-execution layer.** Nothing here signs or places an order. Going live is an entire unbuilt phase, deliberately gated behind a policy that first clears the simulator on multiple days and regimes, net of fees.
-- **Maker rebate tiers are whale-only** (they key on *share* of exchange-wide maker volume) — see [`docs/research/fee-schedule.md`](docs/research/fee-schedule.md). Small accounts pay the flat 1.5 bp.
+### Database rows
 
-**Decision docs** (in [`docs/`](docs)): the market-making-vs-taking [strategy memo](docs/strategy-memo.md), the [maker-backtester design](docs/maker-backtester-design.md), the [fee schedule](docs/research/fee-schedule.md), and the [node cost analysis](docs/research/node-cost-analysis.md) (self-host vs provider, decision-ready for when capital allows).
+All configured backends receive the same points. PostgreSQL uses a single `market_data` table: `id`, `timestamp` (timestamptz), `symbol`, `data_type`, `data` (JSONB, lossless), `created_at`, with a composite index on `(symbol, data_type, timestamp)`. Writes go through `BatchingStorage` (default batch 500, flush every 1 s).
+
+## Metrics computed
+
+- OHLCV per timeframe from the live trade buffer or bulk history: `open`, `high`, `low`, `close`, `volume`, `count`, `vwap`. The live path stores 1-minute candles; bulk historical processing generates 1m, 5m, 15m, and 1h.
+- Order book, computed per l2Book snapshot through `BookView`: `best_bid`, `best_ask`, `mid_price`, `spread`, `spread_bps`, `total_bid_volume`, `total_ask_volume`, `bid_depth_5`, `ask_depth_5`, `imbalance` (all levels), `imbalance_5` (top 5, the harder-to-spoof variant), `crossed`, `bid_levels`, `ask_levels`.
+- Technical indicators over the in-memory close history (200 periods): SMA and EMA at 10/20/50, RSI(14), Bollinger bands (20, 2 sigma) with band width, price change, and a 10-period volume SMA with volume ratio.
+- Feed latency: exchange event time minus local receive time, recorded per channel (bbo, l2Book, trades) into log-spaced histograms from 1 ms to 10 s, exposed via `get_stats()["latency_ms"]` in a Prometheus-shaped layout. `scripts/bench_ws_latency.py` reports exact percentiles with an SNTP clock-offset correction.
+- Order-flow imbalance (`research/ofi.py`): per-event best-level OFI summed into non-overlapping windows, regressed against forward mid changes per (window, horizon), with Newey-West t-statistics and decile tables. Reads capture JSONL and archive l2Book hours directly.
+- Maker simulation (`sim/report.py`): per-run PnL decomposed into spread capture, post-fill drift (adverse selection), fees, funding, and mark residual, per coin, queue bound, and latency.
+
+## Command reference
 
 ```bash
-# Capture research tape (runs the trading universe; leave it running to accrue days)
+# Live smoke test (no persistence)
+python scripts/run_pipeline.py test-realtime --symbols BTC --duration 30
+
+# Research capture: all streams to JSONL with dual timestamps
 python scripts/capture.py --symbols BTC,ETH,SOL --duration 3600 --output data/research_capture
 
-# The OFI read on captured or archive data
-python -m hyperliquid_pipeline.research.ofi data/research_capture/*_bbo_*.jsonl --windows 1,5 --horizons 1,5,30
+# Historical pull from S3 (requires AWS credentials; requester-pays, costs money)
+python scripts/run_pipeline.py collect-historical --symbols BTC,ETH --start-date 2024-01-01 --end-date 2024-01-07
 
-# The maker gate: sweep policy params over captured days (ADVISORY under 5 days of tape)
-python -m hyperliquid_pipeline.sim.sweep data/daily_captures --coins BTC,ETH,SOL
+# Full pipeline: live collection + scheduled history + configured databases
+python scripts/run_pipeline.py start
+
+# Feed-latency benchmark
+python scripts/bench_ws_latency.py
+
+# Deterministic book replay from recorded node data
+PYTHONPATH=src python -m hyperliquid_pipeline.book.replay <snapshot.json> <diff files...>
+
+# OFI research read over captured or archive data
+PYTHONPATH=src python -m hyperliquid_pipeline.research.ofi data/research_capture/*_bbo_*.jsonl --windows 1,5 --horizons 1,5,30
+
+# Maker-policy parameter sweep and gate
+PYTHONPATH=src python -m hyperliquid_pipeline.sim.sweep data/daily_captures --coins BTC,ETH,SOL
 ```
 
-## Running the full thing
+The `scripts/` entrypoints put `src/` on the path themselves. The `python -m` module commands need `PYTHONPATH=src` because `requirements.txt` installs dependencies only, not the package.
 
-The demo above needs nothing. Beyond that there are two optional pieces.
+Configuration is pydantic-settings over `.env` (see `.env.example`). Everything beyond the public WebSocket is optional: AWS keys enable the archive pull, `OBJECT_STORE_*` enables the R2/S3 cache and mirror, and each database is used only if configured and reachable.
 
-**History from S3.** The archive bucket is requester-pays, so the transfer shows up on your AWS bill. Put `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` in `.env`, then:
+## Limitations
 
-```bash
-.venv/bin/python scripts/run_pipeline.py collect-historical \
-  --symbols BTC,ETH --start-date 2024-01-01 --end-date 2024-01-07
-```
-
-**Databases.** With nothing configured it writes JSONL and Parquet under `data/`. To use the servers:
-
-```bash
-docker run -d --name hl-postgres -e POSTGRES_DB=hyperliquid_data \
-  -e POSTGRES_USER=hyperliquid -e POSTGRES_PASSWORD=change_me -p 5432:5432 postgres:15
-docker run -d --name hl-influx -p 8086:8086 influxdb:2.7
-docker run -d --name hl-redis  -p 6379:6379 redis:7
-```
-
-Copy `.env.example` to `.env`, fill in what you actually run, then:
-
-```bash
-.venv/bin/python scripts/run_pipeline.py start
-```
-
-Every database is optional — one that isn't configured (or isn't reachable) is skipped with a warning rather than crashing the pipeline.
-
-**Storing to Cloudflare R2 (or any S3-compatible store).** Hyperliquid's archive is on AWS S3 and requester-pays — you can't move the *source*, so the first pull of a given object lands on your AWS bill. But you can point the pipeline at your own S3-compatible bucket to cache raw pulls and hold processed output. On R2 that means you pull each object from AWS **once**, then re-read it from R2 instead of paying AWS again — R2 charges no egress (you still pay R2's per-request and storage costs, which are small). Works with R2, AWS S3, Backblaze B2, or MinIO. This needs **its own credentials, separate from the AWS keys above** that read the source archive. In `.env`:
-
-```bash
-OBJECT_STORE_BACKEND=r2                    # r2 | s3 | local | none | auto
-OBJECT_STORE_ENDPOINT_URL=https://<account_id>.r2.cloudflarestorage.com
-OBJECT_STORE_BUCKET=hyperliquid-data
-OBJECT_STORE_ACCESS_KEY_ID=<r2_access_key>
-OBJECT_STORE_SECRET_ACCESS_KEY=<r2_secret_key>
-OBJECT_STORE_REGION=auto
-```
-
-With that set, `collect-historical` caches raw LZ4 under `raw/…` (read-through: a re-run reads from R2, not AWS) and mirrors processed Parquet under `processed/…`; the live collector uploads each finished JSONL file on date-rollover and on clean shutdown. Caching is best-effort — if an upload fails it's logged and the next run falls back to the source. Leave `OBJECT_STORE_BUCKET` blank to keep everything on local disk.
-
-## Layout
-
-```
-src/hyperliquid_pipeline/
-├── collectors/    realtime (WebSocket) + lossless spool + historical (S3) + node diff feed
-├── book/          L4/L2 order-book reconstruction, diff parser, replay (BookView)
-├── bench/         ws feed-latency benchmark (exact percentiles, SNTP-corrected)
-├── sim/           event-driven maker simulator: queue model, engine, policy, sweep + gate
-├── research/      OFI signal research (Cont–Kukanov–Stoikov + forward-return regression)
-├── processors/    OHLCV, indicators, book metrics via BookView
-├── storage/       PostgreSQL, InfluxDB, Redis + S3/R2 object store
-├── scheduler/     APScheduler orchestration
-├── utils/         validation, quality reports, latency histograms
-├── backtest/      engine, strategies, metrics, OHLCV loaders
-└── config/        pydantic-settings (.env)
-scripts/run_pipeline.py       CLI: start · collect-historical · test-realtime
-scripts/capture.py            research capture (all streams → JSONL, dual timestamps)
-scripts/bench_ws_latency.py   feed-latency benchmark
-scripts/run_maker_sim.py      maker sim grid over a capture
-docs/                         strategy memo, maker-backtester design, fee & node research
-tests/                        unit tests, no network
-```
-
-## Backtesting
-
-Closes the loop: collect data with the pipeline, then test a strategy against it.
-
-```python
-from hyperliquid_pipeline.backtest import run_backtest, SMACrossover, data
-
-ohlcv = data.from_trades_parquet("data/processed/2024-01-02/BTC/trades.parquet", freq="5min")
-result = run_backtest(ohlcv, SMACrossover(fast=10, slow=30), fee_bps=10, slippage_bps=2)
-print(result.report())
-```
-
-What it does and doesn't do:
-
-- **No lookahead.** A signal computed from bar *i*'s close is executed starting bar *i+1* (positions are the signals shifted one bar). A strategy can't trade on the bar it just saw close.
-- **Costs are modelled.** Fees + slippage (in bps per side) are charged on traded notional every time the position changes — a long→short flip pays both sides.
-- **Long, short, flat** via a target position in `[-1, 1]`; returns compound into the equity curve.
-- Reports total return, CAGR, Sharpe, Sortino, max drawdown, win rate, profit factor, expectancy, trade count, and exposure.
-- Strategies included: `BuyAndHold` (baseline), `SMACrossover`, `RSIStrategy`. Write your own by subclassing `Strategy` and returning a target-position series.
-
-It is intentionally a clear, honest backtester (vectorized close-to-close with explicit cost and lag), not an exchange simulator — there's no partial-fill, queue-position, or funding-cost modelling. Treat results as a directional read, not a promise.
+- Hyperliquid only, by design. The collectors, archive layout, and book parsers are written against this one venue, and the code is exercised against perpetual symbols (BTC, ETH, SOL by default). No spot-specific handling, no other exchanges.
+- No execution layer. Nothing signs or submits an order. The wallet address setting only subscribes to the `user` event stream; the private-key setting is read by config and used nowhere.
+- The public l2Book feed is snapshots, not deltas, so book metrics are per-snapshot and there is no queue position from the public feed alone. Per-order state requires node `--write-raw-book-diffs` output or the QuickNode gRPC stream.
+- Gap backfill is currently inoperative against the public archive. It targets trades, but the archive's `market_data` prefix contains only `l2Book` hours (verified against the live bucket; see the note in `historical_collector.py`), so reconnect gaps in the trade stream are not recoverable from that source. The order book heals from the next snapshot; missed allMids and asset-context messages are simply gone.
+- The live processing queue is drop-oldest under sustained load (drops are counted in `get_stats()`), so the processed stream can shed points during bursts. The lossless spool covers raw frames but is off by default.
+- allMids and activeAssetCtx carry no exchange timestamp, so they are stamped with the local clock and excluded from feed-latency measurement. All latency numbers include local clock offset; the bench estimates it with a single SNTP probe and reports both raw and adjusted values.
+- Live OHLCV and indicator state is in memory: a 1-hour trade retention window and 200 periods of close history, reset on restart. The stored candle cadence on the live path is 1 minute.
+- The bar backtester is vectorized close-to-close with per-side costs. It has no partial fills, no queue modeling, and no funding. The maker simulator covers those, but it runs a single submit delay per sweep, keeps funding accrual off in the sweep gate, and its L2 queue model brackets reality with three cancel-assumption bounds rather than observing real queue position (exact mode requires L4 data).
+- The block-envelope wrapper format for node files is only partially verified publicly; unverified assumptions in `book/diff_parser.py` are tagged `VERIFY-ON-REAL-DATA` and the strict parsing mode exists to pin them against real node output.
+- The historical collector handles `l2Book`, `trades`, `asset_ctxs`, and `node_fills` locations; there is no candle download. Archive pulls are requester-pays, so history costs real money on your AWS bill.
+- Telegram and Prometheus settings exist in `.env.example` but no alerting or exporter code uses them yet; the latency histogram layout is merely exporter-ready.
 
 ## Tests
 
@@ -252,16 +181,7 @@ It is intentionally a clear, honest backtester (vectorized close-to-close with e
 .venv/bin/python -m pytest tests/ -v
 ```
 
-Cover the parts where the math has to be right: OHLCV and VWAP, orderbook spread/depth/imbalance against numbers worked out by hand, RSI and Bollinger edge cases, the validator's error paths, and WebSocket parsing against real Hyperliquid payloads. Nothing in the suite touches the network.
-
-## Worth knowing
-
-- The l2Book feed sends full snapshots per update, not deltas — metrics are computed per snapshot. For event-level top-of-book use the `bbo` feed; for true order-level deltas you need a node's raw book diffs (which `book/` already parses and replays).
-- Latency numbers include your local clock offset. The bench harness estimates it via SNTP and reports raw + adjusted; treat sub-10ms differences as noise unless the host runs disciplined NTP.
-- S3 history costs real money (requester-pays). Start with a few days, and point `OBJECT_STORE_*` at R2 to avoid paying AWS twice for the same object.
-- Processed Parquet is mirrored to the object store for durability and sharing; the pipeline itself reads back only the raw cache, not processed output.
-- Indicators run over in-memory history, so restarting the process resets their state.
-- Hyperliquid only. The collectors are written against its API on purpose.
+370 test functions across the collectors, book core, simulator, backtester, and processors, run in CI on Python 3.11 and 3.12. Nothing in the suite touches the network; WebSocket parsing is tested against recorded Hyperliquid payloads and book reconstruction against fixture files.
 
 ## License
 
